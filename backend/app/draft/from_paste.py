@@ -214,7 +214,7 @@ def build_request(
     courses_text: str,
     elective_blocks_raw: list[dict] | None = None,
     extra_courses: list[ParsedCourse] | None = None,
-    time_limit_sec: int = 60,
+    time_limit_sec: int = 20,
 ) -> TimetableRequest:
     parsed = parse_courses_text(courses_text)
     if extra_courses:

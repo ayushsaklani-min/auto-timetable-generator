@@ -174,7 +174,8 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
       },
       courses_text: coursesText,
       elective_blocks,
-      time_limit_sec: 60,
+      // Keep wizard solves within the same budget as the reference flow.
+      time_limit_sec: 20,
     }
   }
 

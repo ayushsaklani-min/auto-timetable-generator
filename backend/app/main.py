@@ -164,7 +164,12 @@ class DraftBuildRequest(BaseModel):
     skeleton: DraftSkeleton
     courses_text: str
     elective_blocks: list[dict] = []  # passed straight to builder
-    time_limit_sec: int = 60
+    time_limit_sec: int = 20
+
+
+def _normalise_draft_time_limit(limit: int) -> int:
+    """Keep wizard solves inside the same latency budget as the core API."""
+    return max(5, min(int(limit or 20), 20))
 
 
 @app.post("/draft/import-documents")
@@ -236,7 +241,7 @@ def draft_preview(body: DraftBuildRequest) -> dict:
             sk,
             body.courses_text,
             elective_blocks_raw=body.elective_blocks,
-            time_limit_sec=body.time_limit_sec,
+            time_limit_sec=_normalise_draft_time_limit(body.time_limit_sec),
         )
     except Exception as e:
         return {"ok": False, "error": str(e)[:300]}
@@ -289,7 +294,7 @@ def draft_build(body: DraftBuildRequest) -> GenerateResponse:
             sk,
             body.courses_text,
             elective_blocks_raw=body.elective_blocks,
-            time_limit_sec=body.time_limit_sec,
+            time_limit_sec=_normalise_draft_time_limit(body.time_limit_sec),
         )
     except Exception as e:
         raise HTTPException(400, f"Parse failed: {str(e)[:300]}")
