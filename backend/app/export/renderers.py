@@ -57,6 +57,81 @@ def _cell_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
     return Paragraph(escape(text).replace("\n", "<br/>"), style)
 
 
+def _clean_faculty_name(name: str) -> str:
+    return name.split(" (", 1)[0].strip()
+
+
+def _dot_time_12h(hhmm: str) -> str:
+    try:
+        hh, mm = [int(x) for x in hhmm.split(":")]
+        hh = hh % 12 or 12
+        return f"{hh}.{mm:02d}"
+    except Exception:
+        return hhmm.replace(":", ".")
+
+
+def _slot_timing_template(req: TimetableRequest, t: int) -> str:
+    timings = req.time_config.slot_timings
+    if t - 1 >= len(timings):
+        return ""
+    tm = timings[t - 1]
+    return f"{_dot_time_12h(tm.start)}-{_dot_time_12h(tm.end)}"
+
+
+def _break_timing_template(req: TimetableRequest, after_slot: int, duration_min: int) -> str:
+    timings = req.time_config.slot_timings
+    if after_slot - 1 >= len(timings):
+        return ""
+    try:
+        end_str = timings[after_slot - 1].end
+        start_dt = datetime.strptime(end_str, "%H:%M")
+        end_dt = start_dt + timedelta(minutes=duration_min)
+        return f"{_dot_time_12h(start_dt.strftime('%H:%M'))}-{_dot_time_12h(end_dt.strftime('%H:%M'))}"
+    except Exception:
+        return ""
+
+
+def _roman(n: int) -> str:
+    vals = {
+        1: "I",
+        2: "II",
+        3: "III",
+        4: "IV",
+        5: "V",
+        6: "VI",
+        7: "VII",
+        8: "VIII",
+        9: "IX",
+        10: "X",
+    }
+    return vals.get(n, str(n))
+
+
+def _full_day_label(day: str) -> str:
+    return {
+        "MON": "MONDAY",
+        "TUE": "TUESDAY",
+        "WED": "WEDNESDAY",
+        "THU": "THURSDAY",
+        "FRI": "FRIDAY",
+        "SAT": "SATURDAY",
+        "SUN": "SUNDAY",
+    }.get(day, day)
+
+
+def _saturday_note(req: TimetableRequest) -> str:
+    weeks = req.time_config.saturday_rules.inactive_weeks
+    if not weeks:
+        return "Note: Saturday classes as per timetable."
+    ord_map = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
+    parts = [ord_map.get(w, f"{w}th") for w in weeks]
+    if len(parts) == 1:
+        txt = parts[0]
+    else:
+        txt = ", ".join(parts[:-1]) + " and " + parts[-1]
+    return f"Note: No Classes on {txt} Saturday of every Month"
+
+
 # ---------------------------------------------------------------------------
 # Grid building
 # ---------------------------------------------------------------------------
@@ -68,8 +143,9 @@ def _section_grid(tt: Timetable, sec_id: str, days: list[str], slots: list[int])
         cell = grid[(c.day, c.slot)]
         label = c.label or c.course_code
         batch = f" ({c.batch_id})" if c.batch_id else ""
-        if label not in cell[0] if cell else True:
-            cell.append(f"{label}{batch}")
+        full = f"{label}{batch}"
+        if full not in cell:
+            cell.append(full)
     return grid
 
 
@@ -87,9 +163,9 @@ def _faculty_grid(tt: Timetable, faculty_id: str, days: list[str], slots: list[i
 
 def _section_faculty_rows(req: TimetableRequest, tt: Timetable, sec_id: str) -> list[dict[str, str]]:
     course_by_code = {c.code: c for c in req.courses}
-    faculty_by_id = {f.id: f.name for f in req.faculty}
+    faculty_by_id = {f.id: _clean_faculty_name(f.name) for f in req.faculty}
     block_by_id = {b.id: b for b in req.elective_blocks}
-    type_rank = {"THEORY": 0, "LAB": 1, "ACTIVITY": 2}
+    course_order = {c.code: i for i, c in enumerate(req.courses)}
     rows: dict[str, dict] = {}
 
     def upsert(course_code: str, fallback_name: str | None = None) -> dict:
@@ -97,13 +173,12 @@ def _section_faculty_rows(req: TimetableRequest, tt: Timetable, sec_id: str) -> 
         course_name = course.name if course else (fallback_name or course_code)
         credits = str(course.credits) if course else "—"
         if course_code not in rows:
-            rank = type_rank.get(course.type.value, 3) if course else 4
             rows[course_code] = {
                 "course_name": course_name,
                 "course_code": course_code,
                 "credits": credits,
                 "faculty": set(),
-                "rank": rank,
+                "order": course_order.get(course_code, 10_000 + len(rows)),
             }
         return rows[course_code]
 
@@ -137,7 +212,7 @@ def _section_faculty_rows(req: TimetableRequest, tt: Timetable, sec_id: str) -> 
             entry["faculty"].add(faculty_by_id.get(c.faculty_id, c.faculty_id))
 
     out: list[dict[str, str]] = []
-    for row in sorted(rows.values(), key=lambda r: (r["rank"], r["course_name"])):
+    for row in sorted(rows.values(), key=lambda r: (r["order"], r["course_name"])):
         faculty_names = ", ".join(sorted(row["faculty"])) if row["faculty"] else "—"
         out.append(
             {
@@ -159,10 +234,10 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
         buf,
         pagesize=landscape(A4),
         title="Timetable",
-        leftMargin=1.2 * cm,
-        rightMargin=1.2 * cm,
-        topMargin=1.2 * cm,
-        bottomMargin=1.2 * cm,
+        leftMargin=0.8 * cm,
+        rightMargin=0.8 * cm,
+        topMargin=0.8 * cm,
+        bottomMargin=0.8 * cm,
     )
     styles = getSampleStyleSheet()
     elements: list = []
@@ -170,65 +245,106 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
     days = req.time_config.days
     slots = list(range(1, req.time_config.slots_per_day + 1))
     cols = _columns(req)
-    n_cols = 1 + len(cols)  # +1 for the Day column
     break_col_idxs = [i + 1 for i, c in enumerate(cols) if c["kind"] == "break"]
-
-    # Column widths: Day | slot... | break (wide enough for "BREAK" bold) | ... .
-    page_w = landscape(A4)[0] - 2 * (1.2 * cm)
-    break_w = 1.5 * cm  # accommodates "BREAK" at 8pt bold with padding
-    day_w = 1.7 * cm
-    remaining = page_w - day_w - break_w * len(break_col_idxs)
     slot_count = sum(1 for c in cols if c["kind"] == "slot")
-    slot_w = max(remaining / slot_count, 1.5 * cm) if slot_count else 2 * cm
+
+    page_w = landscape(A4)[0] - doc.leftMargin - doc.rightMargin
+    break_w = 1.9 * cm
+    day_w = 2.8 * cm
+    remaining = page_w - day_w - break_w * len(break_col_idxs)
+    slot_w = max(remaining / max(slot_count, 1), 1.8 * cm)
     col_widths = [day_w]
     for c in cols:
         col_widths.append(break_w if c["kind"] == "break" else slot_w)
 
-    AMBER = colors.HexColor("#F4C752")
-    AMBER_SOFT = colors.HexColor("#FCE9B6")
-    NAVY = colors.HexColor("#0E2447")
-    INK = colors.HexColor("#161412")
-    header_style = ParagraphStyle(
-        "TimetableHeader",
+    institute_style = ParagraphStyle(
+        "InstituteHeader",
         parent=styles["Normal"],
         fontName="Helvetica-Bold",
-        fontSize=8,
-        leading=9,
-        alignment=1,  # center
-        textColor=colors.whitesmoke,
+        fontSize=14,
+        leading=15,
+        alignment=1,
         spaceBefore=0,
         spaceAfter=0,
     )
-    day_style = ParagraphStyle(
-        "TimetableDay",
+    dept_style = ParagraphStyle(
+        "DeptHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=9,
+        leading=10,
+        alignment=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    meta_style = ParagraphStyle(
+        "MetaHeader",
         parent=styles["Normal"],
         fontName="Helvetica-Bold",
         fontSize=8,
         leading=9,
         alignment=1,
-        textColor=NAVY,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    grid_header_style = ParagraphStyle(
+        "GridHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=9,
+        alignment=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    time_style = ParagraphStyle(
+        "GridTime",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=7,
+        leading=8,
+        alignment=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    day_style = ParagraphStyle(
+        "GridDay",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=9,
+        alignment=1,
         spaceBefore=0,
         spaceAfter=0,
     )
     body_style = ParagraphStyle(
-        "TimetableBody",
+        "GridBody",
         parent=styles["Normal"],
-        fontName="Helvetica",
-        fontSize=7.4,
-        leading=9,
+        fontName="Helvetica-Bold",
+        fontSize=7.6,
+        leading=8.6,
         alignment=1,
         wordWrap="CJK",
         spaceBefore=0,
         spaceAfter=0,
     )
     break_style = ParagraphStyle(
-        "TimetableBreak",
+        "GridBreak",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8.2,
+        leading=9.2,
+        alignment=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    note_style = ParagraphStyle(
+        "Note",
         parent=styles["Normal"],
         fontName="Helvetica-Bold",
         fontSize=8,
-        leading=10,
+        leading=9,
         alignment=1,
-        textColor=INK,
         spaceBefore=0,
         spaceAfter=0,
     )
@@ -239,7 +355,6 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
         fontSize=8,
         leading=9,
         alignment=1,
-        textColor=INK,
         spaceBefore=0,
         spaceAfter=0,
     )
@@ -251,155 +366,246 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
         leading=9,
         alignment=1,
         wordWrap="CJK",
-        textColor=INK,
         spaceBefore=0,
         spaceAfter=0,
     )
+    tea_range = _break_timing_template(
+        req, req.time_config.tea_break.after_slot, req.time_config.tea_break.duration_min
+    )
+    lunch_range = _break_timing_template(
+        req, req.time_config.lunch_break.after_slot, req.time_config.lunch_break.duration_min
+    )
 
-    for sec in req.sections:
-        elements.append(
-            Paragraph(
-                f"<b>{sec.name}</b> &nbsp;·&nbsp; <font color='#6B6356'>{sec.classroom}</font>",
-                styles["Title"],
+    for sec_idx, sec in enumerate(req.sections):
+        effective_from = datetime.now()
+        top_data = [
+            [_cell_paragraph("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", institute_style), "", ""],
+            [
+                _cell_paragraph(
+                    "DEPARTMENT OF ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING",
+                    dept_style,
+                ),
+                "",
+                "",
+            ],
+            [_cell_paragraph("Academic Year: 2025-26 (EVEN Sem)", meta_style), "", ""],
+            [
+                _cell_paragraph(sec.name, meta_style),
+                _cell_paragraph("Class Time Table", meta_style),
+                _cell_paragraph(f"Class Room: {sec.classroom or '-'}", meta_style),
+            ],
+            [
+                _cell_paragraph(
+                    f"With Effect From: {effective_from.day}/{effective_from.month}/{effective_from.year}",
+                    meta_style,
+                ),
+                "",
+                _cell_paragraph("Version:01", meta_style),
+            ],
+        ]
+        top_tbl = Table(top_data, colWidths=[page_w * 0.28, page_w * 0.44, page_w * 0.28], hAlign="LEFT")
+        top_tbl.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
+                    ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
+                    ("SPAN", (0, 0), (-1, 0)),
+                    ("SPAN", (0, 1), (-1, 1)),
+                    ("SPAN", (0, 2), (-1, 2)),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]
             )
         )
-        elements.append(Spacer(1, 4))
-
-        # Header row: Day | (Slot N + timing) ... | BREAK label ...
-        header: list = [_cell_paragraph("Day", header_style)]
-        for c in cols:
-            if c["kind"] == "slot":
-                t = c["slot"]
-                header.append(_cell_paragraph(f"Slot {t}\n{_slot_timing(req, t)}", header_style))
-            else:
-                header.append(_cell_paragraph(c["label"], break_style))
+        elements.append(top_tbl)
 
         grid = _section_grid(tt, sec.id, days, slots)
-        data = [header]
-        for d in days:
-            row: list = [_cell_paragraph(d, day_style)]
-            for c in cols:
-                if c["kind"] == "break":
-                    row.append("")  # body of break column is empty; spanned by header
-                    continue
-                t = c["slot"]
-                cell = grid.get((d, t))
-                if cell:
-                    row.append(_cell_paragraph("\n".join(cell), body_style))
+        raw_data: list[list[str]] = []
+        roman_row = [""]
+        time_row = [""]
+        for col in cols:
+            if col["kind"] == "slot":
+                roman_row.append(_roman(col["slot"]))
+                time_row.append(_slot_timing_template(req, col["slot"]))
+            else:
+                roman_row.append("")
+                if col["label"] == "TEA BREAK":
+                    time_row.append(tea_range)
+                elif col["label"] == "LUNCH BREAK":
+                    time_row.append(lunch_range)
                 else:
-                    row.append(_cell_paragraph("—" if d == "SAT" else "", body_style))
-            data.append(row)
+                    time_row.append("")
+        raw_data.append(roman_row)
+        raw_data.append(time_row)
 
+        for d in days:
+            row = [_full_day_label(d)]
+            for col in cols:
+                if col["kind"] == "break":
+                    row.append("")
+                    continue
+                cell = grid.get((d, col["slot"]))
+                row.append(" / ".join(cell) if cell else "")
+            raw_data.append(row)
+
+        first_day_row = 2
+        for bc in break_col_idxs:
+            raw_data[first_day_row][bc] = cols[bc - 1]["label"].replace(" ", "\n")
+            for r in range(first_day_row + 1, len(raw_data)):
+                raw_data[r][bc] = ""
+
+        merged_cells: list[tuple[int, int, int]] = []
+        for r in range(first_day_row, len(raw_data)):
+            cidx = 1
+            while cidx < len(raw_data[r]):
+                if cidx in break_col_idxs:
+                    cidx += 1
+                    continue
+                txt = raw_data[r][cidx].strip()
+                if not txt:
+                    cidx += 1
+                    continue
+                end = cidx
+                while (
+                    end + 1 < len(raw_data[r])
+                    and (end + 1) not in break_col_idxs
+                    and raw_data[r][end + 1].strip() == txt
+                ):
+                    end += 1
+                if end > cidx:
+                    merged_cells.append((r, cidx, end))
+                cidx = end + 1
+
+        data: list[list] = []
+        for r, row in enumerate(raw_data):
+            out_row: list = []
+            for cidx, txt in enumerate(row):
+                if not txt:
+                    out_row.append("")
+                    continue
+                if r == 0:
+                    out_row.append(_cell_paragraph(txt, grid_header_style))
+                elif r == 1:
+                    out_row.append(_cell_paragraph(txt, time_style))
+                elif cidx == 0:
+                    out_row.append(_cell_paragraph(txt, day_style))
+                elif cidx in break_col_idxs:
+                    out_row.append(_cell_paragraph(txt, break_style))
+                else:
+                    out_row.append(_cell_paragraph(txt, body_style))
+            data.append(out_row)
+
+        row_heights = [0.50 * cm, 0.60 * cm] + [0.92 * cm for _ in days]
+        tbl = Table(data, colWidths=col_widths, rowHeights=row_heights, hAlign="LEFT")
         style_cmds: list = [
-            # Header band
-            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            # Body type
-            ("FONTSIZE", (0, 0), (-1, -1), 8),
-            ("FONTSIZE", (0, 0), (-1, 0), 8),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
+            ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9CCAA")),
+            ("ALIGN", (0, 0), (-1, 1), "CENTER"),
+            ("ALIGN", (0, 2), (0, -1), "CENTER"),
             ("LEFTPADDING", (0, 0), (-1, -1), 2),
             ("RIGHTPADDING", (0, 0), (-1, -1), 2),
             ("TOPPADDING", (0, 0), (-1, -1), 2),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFBED"), colors.white]),
-            # Day column emphasis
-            ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F0E5C9")),
-            ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
-            ("TEXTCOLOR", (0, 1), (0, -1), NAVY),
+            ("FONTNAME", (0, 0), (-1, 1), "Helvetica-Bold"),
+            ("FONTNAME", (0, 2), (0, -1), "Helvetica-Bold"),
         ]
-        # Break columns: amber band, span across all rows, two-line label
-        # that fits comfortably inside the column without overflow.
         for bc in break_col_idxs:
-            style_cmds.append(("SPAN", (bc, 0), (bc, len(data) - 1)))
-            style_cmds.append(("BACKGROUND", (bc, 0), (bc, -1), AMBER))
-            style_cmds.append(("TEXTCOLOR", (bc, 0), (bc, -1), INK))
-            style_cmds.append(("FONTNAME", (bc, 0), (bc, -1), "Helvetica-Bold"))
-            style_cmds.append(("FONTSIZE", (bc, 0), (bc, -1), 8))
-            style_cmds.append(("LEADING", (bc, 0), (bc, -1), 10))
+            style_cmds.append(("SPAN", (bc, first_day_row), (bc, len(data) - 1)))
+            style_cmds.append(("BACKGROUND", (bc, 0), (bc, -1), colors.HexColor("#F5F5F5")))
             style_cmds.append(("ALIGN", (bc, 0), (bc, -1), "CENTER"))
-            style_cmds.append(("VALIGN", (bc, 0), (bc, -1), "MIDDLE"))
-            style_cmds.append(("LEFTPADDING", (bc, 0), (bc, -1), 1))
-            style_cmds.append(("RIGHTPADDING", (bc, 0), (bc, -1), 1))
-            raw = cols[bc - 1]["label"]  # e.g., "TEA BREAK"
-            duration = cols[bc - 1]["duration"]
-            # Stack as two short lines + duration, all fit in 1.5cm.
-            data[0][bc] = _cell_paragraph(raw.replace(" ", "\n") + f"\n{duration} min", break_style)
-
-        tbl = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+        for r, start, end in merged_cells:
+            style_cmds.append(("SPAN", (start, r), (end, r)))
         tbl.setStyle(TableStyle(style_cmds))
         elements.append(tbl)
 
-        # Legend footer per page
-        elements.append(Spacer(1, 6))
-        elements.append(
-            Paragraph(
-                "<font size=7 color='#6B6356'>"
-                f"Tea break {req.time_config.tea_break.duration_min} min after slot "
-                f"{req.time_config.tea_break.after_slot} &nbsp;·&nbsp; "
-                f"Lunch break {req.time_config.lunch_break.duration_min} min after slot "
-                f"{req.time_config.lunch_break.after_slot} &nbsp;·&nbsp; "
-                "Saturday: 1st &amp; 3rd off; locked activities only on others."
-                "</font>",
-                styles["Normal"],
+        note_tbl = Table(
+            [[_cell_paragraph(_saturday_note(req), note_style)]],
+            colWidths=[page_w],
+            hAlign="LEFT",
+        )
+        note_tbl.setStyle(
+            TableStyle(
+                [
+                    ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
+                    ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 2),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                ]
             )
         )
+        elements.append(note_tbl)
 
         faculty_rows = _section_faculty_rows(req, tt, sec.id)
         if faculty_rows:
-            elements.append(Spacer(1, 8))
-            elements.append(Paragraph("<b>Faculty Allocation</b>", styles["Heading4"]))
-            elements.append(Spacer(1, 4))
-            faculty_data = [
+            split_idx = (len(faculty_rows) + 1) // 2
+            left_rows = faculty_rows[:split_idx]
+            right_rows = faculty_rows[split_idx:]
+            n_rows = max(len(left_rows), len(right_rows))
+            faculty_data: list[list] = [
                 [
-                    _cell_paragraph("Course Name", faculty_header_style),
-                    _cell_paragraph("Course Code", faculty_header_style),
-                    _cell_paragraph("Credits", faculty_header_style),
-                    _cell_paragraph("Faculty", faculty_header_style),
+                    _cell_paragraph("COURSE NAME", faculty_header_style),
+                    _cell_paragraph("COURSE CODE", faculty_header_style),
+                    _cell_paragraph("CREDITS", faculty_header_style),
+                    _cell_paragraph("FACULTY", faculty_header_style),
+                    _cell_paragraph("COURSE NAME", faculty_header_style),
+                    _cell_paragraph("COURSE CODE", faculty_header_style),
+                    _cell_paragraph("CREDITS", faculty_header_style),
+                    _cell_paragraph("FACULTY", faculty_header_style),
                 ]
             ]
-            for row in faculty_rows:
+            for i in range(n_rows):
+                lrow = left_rows[i] if i < len(left_rows) else None
+                rrow = right_rows[i] if i < len(right_rows) else None
                 faculty_data.append(
                     [
-                        _cell_paragraph(row["course_name"], faculty_body_style),
-                        _cell_paragraph(row["course_code"], faculty_body_style),
-                        _cell_paragraph(row["credits"], faculty_body_style),
-                        _cell_paragraph(row["faculty"], faculty_body_style),
+                        _cell_paragraph(lrow["course_name"] if lrow else "", faculty_body_style),
+                        _cell_paragraph(lrow["course_code"] if lrow else "", faculty_body_style),
+                        _cell_paragraph(lrow["credits"] if lrow else "", faculty_body_style),
+                        _cell_paragraph(lrow["faculty"] if lrow else "", faculty_body_style),
+                        _cell_paragraph(rrow["course_name"] if rrow else "", faculty_body_style),
+                        _cell_paragraph(rrow["course_code"] if rrow else "", faculty_body_style),
+                        _cell_paragraph(rrow["credits"] if rrow else "", faculty_body_style),
+                        _cell_paragraph(rrow["faculty"] if rrow else "", faculty_body_style),
                     ]
                 )
 
-            faculty_col_widths = [6.2 * cm, 2.6 * cm, 1.6 * cm, page_w - (10.4 * cm)]
-            fac_tbl = Table(
-                faculty_data,
-                colWidths=faculty_col_widths,
-                repeatRows=1,
-                hAlign="LEFT",
-            )
+            half_w = page_w / 2
+            cname_w = 3.5 * cm
+            ccode_w = 2.2 * cm
+            cred_w = 1.3 * cm
+            fac_w = half_w - cname_w - ccode_w - cred_w
+            faculty_col_widths = [cname_w, ccode_w, cred_w, fac_w, cname_w, ccode_w, cred_w, fac_w]
+            fac_tbl = Table(faculty_data, colWidths=faculty_col_widths, hAlign="LEFT")
             fac_tbl.setStyle(
                 TableStyle(
                     [
-                        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9CCAA")),
-                        ("BACKGROUND", (0, 0), (-1, 0), AMBER_SOFT),
+                        ("GRID", (0, 0), (-1, -1), 0.8, colors.black),
+                        ("BOX", (0, 0), (-1, -1), 1.1, colors.black),
                         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                        ("ALIGN", (1, 1), (2, -1), "CENTER"),
+                        ("ALIGN", (5, 1), (6, -1), "CENTER"),
                         ("LEFTPADDING", (0, 0), (-1, -1), 2),
                         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
                         ("TOPPADDING", (0, 0), (-1, -1), 2),
                         ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FFFBED")]),
-                        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-                        ("ALIGN", (1, 1), (2, -1), "CENTER"),
-                        ("ALIGN", (0, 1), (0, -1), "LEFT"),
-                        ("ALIGN", (3, 1), (3, -1), "LEFT"),
+                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ]
                 )
             )
             elements.append(fac_tbl)
-        elements.append(PageBreak())
 
-    if not elements:
+        if sec_idx < len(req.sections) - 1:
+            elements.append(PageBreak())
+
+    if not req.sections:
         elements.append(Paragraph("No data", styles["Normal"]))
     doc.build(elements)
     return buf.getvalue()
