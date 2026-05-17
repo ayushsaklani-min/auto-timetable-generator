@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { GenerateResponse, TimetableRequest } from '../lib/api'
+import CoursesFacultyPanel from './CoursesFacultyPanel'
 
 const API = '/api'
 
@@ -116,6 +117,13 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
     () => Array.from({ length: nSections }, (_, i) => String.fromCharCode(65 + i)),
     [nSections],
   )
+
+  function handleCoursesTextChange(nextText: string) {
+    setCoursesText(nextText)
+    setPreview(null)
+    setError(null)
+    setPreflightErrors([])
+  }
 
   function buildPayload() {
     const elective_blocks = electives.map((b) => ({
@@ -363,7 +371,19 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
           )}
 
           {step === 2 && (
-            <div className="space-y-3">
+            <>
+              <CoursesFacultyPanel
+                rawText={coursesText}
+                onChange={handleCoursesTextChange}
+                sectionIds={sectionIds}
+                onPreview={refreshPreview}
+                preview={preview}
+                error={error}
+                preflightErrors={preflightErrors}
+                busy={busy}
+              />
+              {false && (
+                <div className="space-y-3">
               <div className="flex items-start justify-between gap-3">
                 <div>
                   <h3 className="font-semibold text-slate-800">Courses & faculty</h3>
@@ -414,7 +434,9 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
                   </ul>
                 </div>
               )}
-            </div>
+                </div>
+              )}
+            </>
           )}
 
           {step === 3 && (
