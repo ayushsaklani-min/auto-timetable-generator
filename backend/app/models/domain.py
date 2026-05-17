@@ -145,6 +145,8 @@ class ElectiveOption(BaseModel):
     course_code: str
     course_name: str
     faculty_pool: list[str]  # faculty ids
+    assigned_sections: list[str] = Field(default_factory=list)
+    assigned_faculty_id: Optional[str] = None
 
 
 class ElectiveBlock(BaseModel):

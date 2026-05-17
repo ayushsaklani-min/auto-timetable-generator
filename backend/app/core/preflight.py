@@ -138,12 +138,21 @@ def validate(req: TimetableRequest) -> PreflightReport:
             )
 
     # Faculty workload sanity
+    elective_codes = {
+        opt.course_code for block in req.elective_blocks for opt in block.options
+    }
     fac_load: dict[str, int] = defaultdict(int)
+    counted_combined: set[tuple[str, str]] = set()
     for fac in req.faculty:
         for asn in fac.assignments:
             course = courses_by_code.get(asn.course_code)
             if course is None:
                 continue
+            if course.code in elective_codes or course.combined_sections:
+                key = (fac.id, course.code)
+                if key in counted_combined:
+                    continue
+                counted_combined.add(key)
             fac_load[fac.id] += course.effective_weekly_slots()
     max_week_slots = len(tc.days) * tc.slots_per_day
     for fid, load in fac_load.items():
@@ -153,27 +162,19 @@ def validate(req: TimetableRequest) -> PreflightReport:
             )
 
     # Elective pool sanity
-    section_ids = {s.id for s in req.sections}
     for block in req.elective_blocks:
-        n_sections = len(set(block.applies_to_sections) & section_ids)
         for opt in block.options:
             if len(opt.faculty_pool) < 1:
                 errors.append(
                     f"Elective option {opt.course_code} has empty faculty pool"
                 )
-            # If only one option exists, faculty pool must cover all sections
-            if len(block.options) == 1 and len(opt.faculty_pool) < n_sections:
-                errors.append(
-                    f"Elective {block.name} option {opt.course_code}: pool "
-                    f"{len(opt.faculty_pool)} < sections {n_sections}"
-                )
-        # Combined coverage of the pool must allow at least 1 parallel teaching
-        # per section that wants the block.
+        # Elective blocks use combined teaching per option, so the combined
+        # pool only needs to cover the available options, not every section.
         total_pool = sum(len(o.faculty_pool) for o in block.options)
-        if total_pool < n_sections:
+        if total_pool < len(block.options):
             errors.append(
                 f"Elective {block.name}: combined faculty pool {total_pool} < "
-                f"{n_sections} parallel sections"
+                f"{len(block.options)} options"
             )
 
     # Lab consistency: pair_course exists and is also a LAB

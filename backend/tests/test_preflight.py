@@ -38,3 +38,12 @@ def test_elective_pool_too_small():
                 opt.faculty_pool = []
     report = validate(req)
     assert not report.ok
+
+
+def test_elective_pool_needs_options_not_sections():
+    req = build_request()
+    block = req.elective_blocks[0]
+    for opt in block.options:
+        opt.faculty_pool = opt.faculty_pool[:1]
+    report = validate(req)
+    assert report.ok, report.errors

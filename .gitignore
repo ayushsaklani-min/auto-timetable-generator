@@ -45,3 +45,4 @@ timetable_generator_blueprint.md
 
 # Server-side job store (created at runtime on the backend host)
 backend/jobs/
+backend/.deps/

@@ -8,12 +8,12 @@ The paste format is intentionally forgiving and spreadsheet-friendly:
   Types:
     theory
     lab                       (solo lab)
-    lab pair=BCSL404          (paired with another lab — H5 batch swap)
+    lab pair=BCSL404          (paired with another lab - H5 batch swap)
     activity                  (flex activity, placed by solver)
     activity locked=FRI:5,6,7 (locked to a specific day + slot list)
 
   Faculty list (after the 4th comma):
-    Dr A; Dr B; Dr C            (one per section, in order A, B, C, ...)
+    Dr A; Dr B; Dr C            (teacher pool, auto-balanced across sections)
     same-as=BAI402              (re-use the faculty assigned to BAI402)
     auto                        (auto-generate "<Code> Faculty X" placeholders)
     x6                          (generate 6 placeholders)
@@ -45,6 +45,13 @@ from ..models.domain import (
     TimeConfig,
     Timing,
     TimetableRequest,
+)
+from .pool_assign import (
+    AssignmentTarget,
+    PoolAssignmentError,
+    assign_targets,
+    even_groups,
+    slots_tuple,
 )
 
 DAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT"]
@@ -201,7 +208,6 @@ def parse_courses_text(text: str) -> list[ParsedCourse]:
 def _split_faculty(spec: str) -> list[str]:
     if not spec:
         return []
-    # Allow ';', '|', or '/' as delimiters
     parts = re.split(r"\s*[;|/]\s*", spec)
     return [p.strip() for p in parts if p.strip()]
 
@@ -220,19 +226,27 @@ def build_request(
     if extra_courses:
         parsed.extend(extra_courses)
 
+    section_batches = {
+        sec_id: [f"{sec_id}{idx + 1}" for idx in range(skeleton.batches_per_section)]
+        for sec_id in skeleton.section_ids
+    }
+
+    elective_course_codes: set[str] = set()
+    if elective_blocks_raw:
+        for blk in elective_blocks_raw:
+            for opt in blk.get("options", []):
+                elective_course_codes.add(opt["course_code"])
+
     # ---- Build courses ----
     courses: list[Course] = []
     for p in parsed:
         weekly_slots: Optional[int] = None
         if p.type is CourseType.LAB:
-            # 1cr lab → 1 session (2 slots) typical for BMSIT
-            # 2+ credits could be 2 sessions (4 slots)
             weekly_slots = 4 if (p.pair_course and p.credits >= 1) else 2
         elif p.type is CourseType.ACTIVITY:
             weekly_slots = max(p.credits, 1) if p.credits else 1
             if p.locked_slots:
                 weekly_slots = len(p.locked_slots)
-        # theory: leave None to fall back to credits
         courses.append(
             Course(
                 code=p.code,
@@ -245,17 +259,36 @@ def build_request(
                 locked_day=p.locked_day,
                 locked_slots=p.locked_slots,
                 combined_sections=p.is_combined
-                or (p.type is CourseType.ACTIVITY and not p.locked_day),
+                or (p.type is CourseType.ACTIVITY and not p.locked_day)
+                or (p.code in elective_course_codes),
             )
         )
 
-    # ---- Build faculty ----
-    # Elective options are tracked here so we can mark their faculty pools
-    # but NOT generate per-section assignments for them (the block reserves
-    # the slots globally).
-    elective_codes_to_pool: dict[str, list[str]] = {}
+    existing_course_codes = {course.code for course in courses}
+    if elective_blocks_raw:
+        for blk in elective_blocks_raw:
+            weekly_slots = int(blk.get("weekly_slot_count", 4))
+            for opt in blk.get("options", []):
+                code = opt["course_code"]
+                if code in existing_course_codes:
+                    continue
+                courses.append(
+                    Course(
+                        code=code,
+                        name=opt.get("course_name", code),
+                        credits=max(1, min(weekly_slots, 4)),
+                        weekly_slots=weekly_slots,
+                        type=CourseType.THEORY,
+                        combined_sections=True,
+                    )
+                )
+                existing_course_codes.add(code)
+
     elective_blocks_resolved: list[ElectiveBlock] = []
-    fac_index: dict[str, Faculty] = {}  # name -> Faculty
+    fac_index: dict[str, Faculty] = {}
+    fac_by_id: dict[str, Faculty] = {}
+    course_assignments: dict[str, list[tuple[str, Assignment]]] = {}
+    global_teacher_loads: dict[str, int] = {}
     fac_count = 0
 
     def make_fac(name: str) -> Faculty:
@@ -264,109 +297,145 @@ def build_request(
         if existing:
             return existing
         fac_count += 1
-        f = Faculty(id=f"F{fac_count:03d}", name=name, assignments=[])
-        fac_index[name] = f
-        return f
+        faculty = Faculty(id=f"F{fac_count:03d}", name=name, assignments=[])
+        fac_index[name] = faculty
+        fac_by_id[faculty.id] = faculty
+        global_teacher_loads.setdefault(faculty.id, 0)
+        return faculty
 
-    # First pass: regular per-course faculty
-    by_code = {p.code: p for p in parsed}
-    elective_course_codes: set[str] = set()
-    if elective_blocks_raw:
-        for blk in elective_blocks_raw:
-            for opt in blk.get("options", []):
-                elective_course_codes.add(opt["course_code"])
+    def append_assignment(
+        teacher_id: str,
+        *,
+        course_code: str,
+        section_id: str,
+        is_lab: bool,
+        batch_id: str | None = None,
+    ) -> None:
+        assignment = Assignment(
+            course_code=course_code,
+            section_id=section_id,
+            is_lab=is_lab,
+            batch_id=batch_id,
+        )
+        fac_by_id[teacher_id].assignments.append(assignment)
+        course_assignments.setdefault(course_code, []).append((teacher_id, assignment))
+
+    def unavailable_by_teacher() -> dict[str, set[tuple[str, int]]]:
+        return {
+            teacher.id: {(slot.day, slot.slot) for slot in teacher.unavailable_slots}
+            for teacher in fac_by_id.values()
+        }
+
+    def section_targets(course: ParsedCourse) -> list[AssignmentTarget]:
+        required_slots = (
+            [(course.locked_day, slot) for slot in course.locked_slots]
+            if course.locked_day and course.locked_slots
+            else []
+        )
+        return [
+            AssignmentTarget(
+                section_id=sec_id,
+                required_slots=slots_tuple(required_slots),
+                label=f"{course.code} section {sec_id}",
+            )
+            for sec_id in skeleton.section_ids
+        ]
+
+    def batch_targets(course: ParsedCourse) -> list[AssignmentTarget]:
+        return [
+            AssignmentTarget(
+                section_id=sec_id,
+                batch_id=batch_id,
+                label=f"{course.code} batch {batch_id}",
+            )
+            for sec_id in skeleton.section_ids
+            for batch_id in section_batches[sec_id]
+        ]
+
+    def assign_pool(course: ParsedCourse, teacher_ids: list[str]) -> None:
+        targets = batch_targets(course) if course.type is CourseType.LAB else section_targets(course)
+        try:
+            picked = assign_targets(
+                teacher_ids,
+                targets,
+                global_teacher_loads,
+                unavailable_by_teacher(),
+                {teacher_id: fac_by_id[teacher_id].name for teacher_id in teacher_ids},
+            )
+        except PoolAssignmentError as e:
+            raise ValueError(str(e))
+        for target, teacher_id in picked:
+            append_assignment(
+                teacher_id,
+                course_code=course.code,
+                section_id=target.section_id,
+                is_lab=course.type is CourseType.LAB,
+                batch_id=target.batch_id,
+            )
+
+    def copy_same_as(course: ParsedCourse, ref_code: str) -> None:
+        refs = list(course_assignments.get(ref_code, []))
+        if not refs:
+            raise ValueError(f"same-as={ref_code} referenced before assignments existed")
+        for teacher_id, ref in refs:
+            if course.type is CourseType.LAB and ref.batch_id is None:
+                for batch_id in section_batches.get(ref.section_id, []):
+                    append_assignment(
+                        teacher_id,
+                        course_code=course.code,
+                        section_id=ref.section_id,
+                        is_lab=True,
+                        batch_id=batch_id,
+                    )
+                    global_teacher_loads[teacher_id] += 1
+            else:
+                append_assignment(
+                    teacher_id,
+                    course_code=course.code,
+                    section_id=ref.section_id,
+                    is_lab=course.type is CourseType.LAB,
+                    batch_id=ref.batch_id if course.type is CourseType.LAB else None,
+                )
+                global_teacher_loads[teacher_id] += 1
 
     for p in parsed:
         if p.code in elective_course_codes:
-            # Handled below in the elective pool builder.
             continue
-        names_or_directives = _split_faculty(p.faculty_spec)
-        if not names_or_directives:
-            # No faculty given: auto-generate one per section
-            names_or_directives = [f"auto"]
-        for name_spec in names_or_directives:
-            if name_spec.lower() == "auto":
-                # Generate one placeholder per section
-                for sec in skeleton.section_ids:
-                    f = make_fac(f"{p.code} Faculty {sec}")
-                    f.assignments.append(
-                        Assignment(
+        names_or_directives = _split_faculty(p.faculty_spec) or ["auto"]
+
+        if len(names_or_directives) == 1 and names_or_directives[0].lower() == "auto":
+            if p.type is CourseType.LAB:
+                for sec_id in skeleton.section_ids:
+                    for batch_id in section_batches[sec_id]:
+                        teacher_id = make_fac(f"{p.code} Faculty {batch_id}").id
+                        append_assignment(
+                            teacher_id,
                             course_code=p.code,
-                            section_id=sec,
-                            is_lab=p.type is CourseType.LAB,
+                            section_id=sec_id,
+                            is_lab=True,
+                            batch_id=batch_id,
                         )
-                    )
-                break
-            if name_spec.lower().startswith("x"):
-                try:
-                    n = int(name_spec[1:])
-                except ValueError:
-                    n = len(skeleton.section_ids)
-                for i in range(n):
-                    sec = skeleton.section_ids[i % len(skeleton.section_ids)]
-                    f = make_fac(f"{p.code} Faculty {i + 1}")
-                    f.assignments.append(
-                        Assignment(
-                            course_code=p.code,
-                            section_id=sec,
-                            is_lab=p.type is CourseType.LAB,
-                        )
-                    )
-                break
-            if name_spec.lower().startswith("same-as="):
-                ref_code = name_spec.split("=", 1)[1].strip()
-                # Copy assignments from another course
-                for fac in fac_index.values():
-                    for a in list(fac.assignments):
-                        if a.course_code == ref_code:
-                            fac.assignments.append(
-                                Assignment(
-                                    course_code=p.code,
-                                    section_id=a.section_id,
-                                    is_lab=p.type is CourseType.LAB,
-                                )
-                            )
-                break
-            # Regular: assign this faculty to one section in order
-            # We round-robin: faculty index i goes to section i mod N
-            idx = sum(
-                1
-                for n2 in names_or_directives[: names_or_directives.index(name_spec)]
-                if not n2.lower().startswith(("auto", "x", "same-as="))
-            )
-            sec = skeleton.section_ids[idx % len(skeleton.section_ids)]
-            f = make_fac(name_spec)
-            f.assignments.append(
-                Assignment(
-                    course_code=p.code,
-                    section_id=sec,
-                    is_lab=p.type is CourseType.LAB,
-                )
-            )
-        # Combined-section courses (e.g., BBOK407 taught by one person to all):
-        # if exactly one faculty name was provided AND the course is single,
-        # extend assignments across all sections.
-        if (
-            len([n for n in names_or_directives if not n.startswith(("auto", "x"))]) == 1
-            and p.type is not CourseType.LAB
-            and not p.is_combined  # avoid duplicating if combined flag also set
-        ):
-            # Only one faculty across all sections → spread.
-            only = [n for n in names_or_directives if not n.startswith(("auto", "x"))][0]
-            f = fac_index.get(only)
-            if f:
-                existing_sections = {
-                    a.section_id for a in f.assignments if a.course_code == p.code
-                }
-                for sec in skeleton.section_ids:
-                    if sec not in existing_sections:
-                        f.assignments.append(
-                            Assignment(
-                                course_code=p.code,
-                                section_id=sec,
-                                is_lab=False,
-                            )
-                        )
+                        global_teacher_loads[teacher_id] += 1
+            else:
+                teacher_ids = [make_fac(f"{p.code} Faculty {sec_id}").id for sec_id in skeleton.section_ids]
+                assign_pool(p, teacher_ids)
+            continue
+
+        if len(names_or_directives) == 1 and names_or_directives[0].lower().startswith("x"):
+            try:
+                count = int(names_or_directives[0][1:])
+            except ValueError:
+                count = len(batch_targets(p)) if p.type is CourseType.LAB else len(section_targets(p))
+            teacher_ids = [make_fac(f"{p.code} Faculty {idx + 1}").id for idx in range(count)]
+            assign_pool(p, teacher_ids)
+            continue
+
+        if len(names_or_directives) == 1 and names_or_directives[0].lower().startswith("same-as="):
+            copy_same_as(p, names_or_directives[0].split("=", 1)[1].strip())
+            continue
+
+        teacher_ids = [make_fac(name).id for name in names_or_directives]
+        assign_pool(p, teacher_ids)
 
     # ---- Build elective blocks ----
     if elective_blocks_raw:
@@ -374,9 +443,8 @@ def build_request(
             opt_objs: list[ElectiveOption] = []
             for opt in blk.get("options", []):
                 pool_ids: list[str] = []
-                for nm in opt.get("faculty", []):
-                    f = make_fac(nm)
-                    pool_ids.append(f.id)
+                for name in opt.get("faculty", []):
+                    pool_ids.append(make_fac(name).id)
                 opt_objs.append(
                     ElectiveOption(
                         course_code=opt["course_code"],
@@ -384,19 +452,56 @@ def build_request(
                         faculty_pool=pool_ids,
                     )
                 )
+
             locked: list[tuple[str, int]] = []
-            for d, s in blk.get("locked_global_slots", []):
-                locked.append((_normalise_day(d), int(s)))
+            for day, slot in blk.get("locked_global_slots", []):
+                locked.append((_normalise_day(day), int(slot)))
+
+            applicable_sections = [
+                sec_id
+                for sec_id in blk.get("applies_to_sections", skeleton.section_ids)
+                if sec_id in section_batches
+            ]
+            grouped_sections = (
+                even_groups([opt.course_code for opt in opt_objs], applicable_sections)
+                if opt_objs
+                else {}
+            )
+            for opt_obj in opt_objs:
+                opt_obj.assigned_sections = grouped_sections.get(opt_obj.course_code, [])
+                if opt_obj.faculty_pool and opt_obj.assigned_sections:
+                    try:
+                        teacher_id = assign_targets(
+                            opt_obj.faculty_pool,
+                            [
+                                AssignmentTarget(
+                                    section_id=",".join(opt_obj.assigned_sections),
+                                    required_slots=slots_tuple(locked),
+                                    load_units=len(opt_obj.assigned_sections),
+                                    label=f"{blk.get('name', 'Elective')} / {opt_obj.course_code}",
+                                )
+                            ],
+                            global_teacher_loads,
+                            unavailable_by_teacher(),
+                            {teacher_id: fac_by_id[teacher_id].name for teacher_id in opt_obj.faculty_pool},
+                        )[0][1]
+                    except PoolAssignmentError as e:
+                        raise ValueError(str(e))
+                    opt_obj.assigned_faculty_id = teacher_id
+                    for sec_id in opt_obj.assigned_sections:
+                        append_assignment(
+                            teacher_id,
+                            course_code=opt_obj.course_code,
+                            section_id=sec_id,
+                            is_lab=False,
+                        )
+
             elective_blocks_resolved.append(
                 ElectiveBlock(
                     id=blk.get("id", "ELEC_BLOCK"),
                     name=blk.get("name", "Elective"),
-                    weekly_slot_count=int(
-                        blk.get("weekly_slot_count", len(locked) or 4)
-                    ),
-                    applies_to_sections=blk.get(
-                        "applies_to_sections", skeleton.section_ids
-                    ),
+                    weekly_slot_count=int(blk.get("weekly_slot_count", len(locked) or 4)),
+                    applies_to_sections=blk.get("applies_to_sections", skeleton.section_ids),
                     applies_to_semesters=[skeleton.semester],
                     locked_global_slots=locked or None,
                     options=opt_objs,
@@ -406,28 +511,23 @@ def build_request(
     # ---- Build sections ----
     sections = [
         Section(
-            id=s,
-            name=f"{skeleton.semester}th Sem {s}",
+            id=sec_id,
+            name=f"{skeleton.semester}th Sem {sec_id}",
             semester=skeleton.semester,
-            classroom=skeleton.classroom_by_section.get(s, ""),
-            batches=[
-                Batch(id=f"{s}{i + 1}", section_id=s)
-                for i in range(skeleton.batches_per_section)
-            ],
+            classroom=skeleton.classroom_by_section.get(sec_id, ""),
+            batches=[Batch(id=batch_id, section_id=sec_id) for batch_id in section_batches[sec_id]],
         )
-        for s in skeleton.section_ids
+        for sec_id in skeleton.section_ids
     ]
 
     # ---- Build time config ----
     sat_locks_list: list[LockedSlot] = []
     for label, slots, sections_filter in skeleton.sat_locks:
         sec_filter = sections_filter or skeleton.section_ids
-        for sec in sec_filter:
-            for s in slots:
+        for sec_id in sec_filter:
+            for slot in slots:
                 sat_locks_list.append(
-                    LockedSlot(
-                        day="SAT", slot=s, label=label, applies_to_sections=[sec]
-                    )
+                    LockedSlot(day="SAT", slot=slot, label=label, applies_to_sections=[sec_id])
                 )
 
     tc = TimeConfig(
@@ -435,13 +535,16 @@ def build_request(
         slots_per_day=skeleton.slots_per_day,
         slot_timings=[Timing(start=a, end=b) for a, b in skeleton.slot_timings],
         tea_break=BreakConfig(
-            after_slot=skeleton.tea_after_slot, duration_min=skeleton.tea_minutes
+            after_slot=skeleton.tea_after_slot,
+            duration_min=skeleton.tea_minutes,
         ),
         lunch_break=BreakConfig(
-            after_slot=skeleton.lunch_after_slot, duration_min=skeleton.lunch_minutes
+            after_slot=skeleton.lunch_after_slot,
+            duration_min=skeleton.lunch_minutes,
         ),
         saturday_rules=SaturdayRules(
-            inactive_weeks=skeleton.inactive_sat_weeks, locked_slots=sat_locks_list
+            inactive_weeks=skeleton.inactive_sat_weeks,
+            locked_slots=sat_locks_list,
         ),
     )
 

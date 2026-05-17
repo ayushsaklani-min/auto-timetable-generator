@@ -16,13 +16,55 @@ from ..models.domain import (
 )
 
 
+def _to_minutes(hhmm: str) -> int | None:
+    try:
+        hh, mm = [int(x) for x in hhmm.split(":")]
+    except Exception:
+        return None
+    return hh * 60 + mm
+
+
+def _blocked_slots(req: TimetableRequest) -> set[int]:
+    timings = req.time_config.slot_timings
+    if not timings:
+        return set()
+
+    breaks: list[tuple[int, int]] = []
+    if 0 < req.time_config.tea_break.after_slot <= len(timings):
+        end_m = _to_minutes(timings[req.time_config.tea_break.after_slot - 1].end)
+        if end_m is not None:
+            breaks.append((end_m, end_m + req.time_config.tea_break.duration_min))
+    if 0 < req.time_config.lunch_break.after_slot <= len(timings):
+        end_m = _to_minutes(timings[req.time_config.lunch_break.after_slot - 1].end)
+        if end_m is not None:
+            breaks.append((end_m, end_m + req.time_config.lunch_break.duration_min))
+
+    blocked: set[int] = set()
+    for slot_idx, timing in enumerate(timings, start=1):
+        start_m = _to_minutes(timing.start)
+        end_m = _to_minutes(timing.end)
+        if start_m is None or end_m is None:
+            continue
+        for break_start, break_end in breaks:
+            if start_m < break_end and end_m > break_start:
+                blocked.add(slot_idx)
+                break
+    return blocked
+
+
 def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
     violations: list[Violation] = []
     courses_by_code = {c.code: c for c in req.courses}
     tc = req.time_config
     break_after = {tc.tea_break.after_slot, tc.lunch_break.after_slot}
+    blocked_slots = _blocked_slots(req)
+    elective_codes = {
+        opt.course_code for block in req.elective_blocks for opt in block.options
+    }
+    combined_codes = {
+        course.code for course in req.courses if course.combined_sections
+    } | elective_codes
 
-    # Build pair index: code -> paired_with
     pair_index: dict[str, str] = {}
     for c in req.courses:
         if c.type == CourseType.LAB and c.pair_course:
@@ -35,10 +77,8 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
     for (s, d, t), items in cell.items():
         if len(items) <= 1:
             continue
-        # Same course, multiple entries → benign (duplicated row of a lab)
         if all(it.course_code == items[0].course_code for it in items):
             continue
-        # Paired labs at same cell are expected: codes match via pair_index
         codes = {it.course_code for it in items if it.is_lab}
         if len(codes) == 2:
             a, b = list(codes)
@@ -64,14 +104,9 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
     for (fid, d, t), items in fac_cell.items():
         if len(items) <= 1:
             continue
-        # Allow same faculty across sections when the course is marked
-        # combined_sections (e.g., Dept-Activity, BENGDIP2).
         codes = {it.course_code for it in items}
-        if len(codes) == 1:
-            code = next(iter(codes))
-            course = courses_by_code.get(code)
-            if course and course.combined_sections:
-                continue
+        if len(codes) == 1 and next(iter(codes)) in combined_codes:
+            continue
         violations.append(
             Violation(
                 code="H1",
@@ -98,11 +133,6 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
 
     # H3 credit satisfaction (per section, per course)
     needed_by_sec_course: dict[tuple[str, str], int] = {}
-    elective_codes = set()
-    for b in req.elective_blocks:
-        for o in b.options:
-            elective_codes.add(o.course_code)
-
     for fac in req.faculty:
         for a in fac.assignments:
             if a.course_code not in courses_by_code:
@@ -114,12 +144,12 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
                 course.effective_weekly_slots()
             )
 
-    placed: dict[tuple[str, str], int] = defaultdict(int)
+    placed: dict[tuple[str, str], set[tuple[str, int]]] = defaultdict(set)
     for c in tt.classes:
-        placed[(c.section_id, c.course_code)] += 1
+        placed[(c.section_id, c.course_code)].add((c.day, c.slot))
 
     for (sec, code), need in needed_by_sec_course.items():
-        got = placed.get((sec, code), 0)
+        got = len(placed.get((sec, code), set()))
         if got != need:
             violations.append(
                 Violation(
@@ -129,13 +159,13 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
             )
 
     # H4 lab consecutiveness + no spanning break
-    # Group lab classes by (section, course, day) and check pairs
-    lab_groups: dict[tuple[str, str, str], list[int]] = defaultdict(list)
+    lab_groups: dict[tuple[str, str, str, str], set[int]] = defaultdict(set)
     for c in tt.classes:
         if c.is_lab:
-            lab_groups[(c.section_id, c.course_code, c.day)].append(c.slot)
-    for (s, code, d), slots in lab_groups.items():
-        slots.sort()
+            batch_key = c.batch_id or "__section__"
+            lab_groups[(c.section_id, c.course_code, c.day, batch_key)].add(c.slot)
+    for (s, code, d, _batch), slot_set in lab_groups.items():
+        slots = sorted(slot_set)
         if len(slots) % 2 != 0:
             violations.append(
                 Violation(
@@ -161,49 +191,60 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
                     )
                 )
 
-    # H7 elective block sync: same elective slots across all applying sections.
-    # Our solver reserves with course_code == block.id and label = block.name.
+    # H7 elective block sync: all participating sections share the same cells,
+    # and option assignment matches the section grouping when available.
     for block in req.elective_blocks:
         sec_set = set(block.applies_to_sections)
+        option_codes = {opt.course_code for opt in block.options}
         per_sec: dict[str, set[tuple[str, int]]] = defaultdict(set)
+        per_sec_codes: dict[str, set[str]] = defaultdict(set)
         for c in tt.classes:
-            if c.section_id in sec_set and c.course_code == block.id:
+            if c.section_id in sec_set and c.course_code in option_codes:
                 per_sec[c.section_id].add((c.day, c.slot))
-        if not per_sec:
+                per_sec_codes[c.section_id].add(c.course_code)
+        expected_cells = set(block.locked_global_slots or [])
+        if not per_sec and not expected_cells:
             continue
-        canonical = next(iter(per_sec.values()))
+        canonical = expected_cells or next(iter(per_sec.values()))
         for sec in sec_set:
-            cells = per_sec.get(sec)
-            if cells is None or cells != canonical:
+            cells = per_sec.get(sec, set())
+            if cells != canonical:
                 violations.append(
                     Violation(
                         code="H7",
                         message=f"Elective {block.name} not synchronized for section {sec}",
-                        details={"expected": sorted(canonical), "got": sorted(cells or [])},
+                        details={"expected": sorted(canonical), "got": sorted(cells)},
                     )
                 )
-        # H8: pool size capacity. Combined teaching means we don't enforce
-        # parallel class count strictly; just ensure block locked slots were
-        # respected and the block was placed at the requested number of slots.
-        if block.locked_global_slots:
-            expected = set(block.locked_global_slots)
-            for sec in sec_set:
-                cells = per_sec.get(sec, set())
-                if cells != expected:
-                    violations.append(
-                        Violation(
-                            code="H7",
-                            message=f"Elective {block.name} for {sec}: cells != locked globals",
-                            details={"expected": sorted(expected), "got": sorted(cells)},
-                        )
+        expected_option_by_section: dict[str, str] = {}
+        for opt in block.options:
+            for sec in opt.assigned_sections:
+                if sec in sec_set:
+                    expected_option_by_section[sec] = opt.course_code
+        for sec, option_code in expected_option_by_section.items():
+            codes = per_sec_codes.get(sec, set())
+            if codes != {option_code}:
+                violations.append(
+                    Violation(
+                        code="H7",
+                        message=f"Elective {block.name} section {sec} assigned wrong option",
+                        details={"expected": option_code, "got": sorted(codes)},
                     )
+                )
 
-    # H9 break sanctity (cosmetic — variables shouldn't create classes during breaks
-    # because we don't allocate slot indices to break times; but check anyway).
+    # H9 break sanctity
+    for c in tt.classes:
+        if c.slot in blocked_slots:
+            violations.append(
+                Violation(
+                    code="H9",
+                    message=f"Class {c.course_code} for section {c.section_id} placed in blocked break slot {c.day}/{c.slot}",
+                )
+            )
+
     # H10 saturday rules
     sat_inactive = req.time_config.saturday_rules.inactive_weeks
     if sat_inactive:
-        # Locked sat slots should be present where defined
         for ls in tc.saturday_rules.locked_slots:
             applies = ls.applies_to_sections or [s.id for s in req.sections]
             for sec in applies:
@@ -222,7 +263,7 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
                         )
                     )
 
-    # H11 hard-locked blocks (courses with locked_day & locked_slots)
+    # H11 hard-locked blocks
     for course in req.courses:
         if not (course.locked_day and course.locked_slots):
             continue
@@ -255,7 +296,6 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
                     )
                 )
 
-    # Compute a soft-score from the timetable (rough 0..100)
     soft_score = _soft_score(req, tt)
     return VerificationReport(
         ok=len(violations) == 0, violations=violations, soft_score=soft_score
@@ -263,11 +303,7 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
 
 
 def _soft_score(req: TimetableRequest, tt: Timetable) -> int:
-    """Rough soft-constraint quality score, 0..100.
-
-    Normalized so a perfectly clean schedule scores 100 and a heavily
-    constraint-violated one approaches 0.
-    """
+    """Rough soft-constraint quality score, 0..100."""
     if not tt.classes:
         return 0
     tc = req.time_config
@@ -276,23 +312,20 @@ def _soft_score(req: TimetableRequest, tt: Timetable) -> int:
     for c in tt.classes:
         cls_by_sec_day[(c.section_id, c.day)].append(c)
 
-    # Normalize: per-section per-day counts, averaged across sections.
     n_sections = max(len({c.section_id for c in tt.classes}), 1)
     n_days = max(len(tc.days), 1)
-    cells_max = n_sections * n_days  # one count per (sec, day)
+    cells_max = n_sections * n_days
 
-    # Component 1: same-course twice on same day (worst = every cell)
     dup_total = 0
     for (sec, d), items in cls_by_sec_day.items():
         seen: dict[str, int] = defaultdict(int)
         for c in items:
             seen[c.course_code] += 1
-        for code, n in seen.items():
-            if n > 1 and not items[0].is_lab:  # lab "duplicates" are spans
+        for _code, n in seen.items():
+            if n > 1 and not items[0].is_lab:
                 dup_total += n - 1
     dup_score = 100 * (1 - min(1.0, dup_total / max(cells_max * 0.3, 1)))
 
-    # Component 2: high-credit theory overflow per day
     high_codes = {
         c.code for c in req.courses
         if c.credits >= 3 and c.type == CourseType.THEORY
@@ -304,7 +337,6 @@ def _soft_score(req: TimetableRequest, tt: Timetable) -> int:
             hc_overflow += hc - 2
     hc_score = 100 * (1 - min(1.0, hc_overflow / max(cells_max * 0.4, 1)))
 
-    # Component 3: post-lunch density
     pl_classes = sum(
         1 for c in tt.classes if c.slot == post_lunch and not c.is_lab
     )

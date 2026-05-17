@@ -33,6 +33,13 @@ from ..models.domain import (
     Timetable,
     TimetableRequest,
 )
+from ..draft.pool_assign import (
+    AssignmentTarget,
+    PoolAssignmentError,
+    assign_targets,
+    even_groups,
+    slots_tuple,
+)
 
 # ---------------------------------------------------------------------------
 # Task representation
@@ -54,6 +61,7 @@ class Task:
     locked_day: Optional[str] = None
     locked_slots: Optional[list[int]] = None
     label: Optional[str] = None
+    session_index: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +75,43 @@ def _break_after(req: TimetableRequest) -> set[int]:
     """
     tc = req.time_config
     return {tc.tea_break.after_slot, tc.lunch_break.after_slot}
+
+
+def _to_minutes(hhmm: str) -> Optional[int]:
+    try:
+        hh, mm = [int(x) for x in hhmm.split(":")]
+    except Exception:
+        return None
+    return hh * 60 + mm
+
+
+def _blocked_slots(req: TimetableRequest) -> set[int]:
+    """Slots whose clock interval overlaps a configured tea/lunch break."""
+    timings = req.time_config.slot_timings
+    if not timings:
+        return set()
+
+    breaks: list[tuple[int, int]] = []
+    if 0 < req.time_config.tea_break.after_slot <= len(timings):
+        end_m = _to_minutes(timings[req.time_config.tea_break.after_slot - 1].end)
+        if end_m is not None:
+            breaks.append((end_m, end_m + req.time_config.tea_break.duration_min))
+    if 0 < req.time_config.lunch_break.after_slot <= len(timings):
+        end_m = _to_minutes(timings[req.time_config.lunch_break.after_slot - 1].end)
+        if end_m is not None:
+            breaks.append((end_m, end_m + req.time_config.lunch_break.duration_min))
+
+    blocked: set[int] = set()
+    for slot_idx, timing in enumerate(timings, start=1):
+        start_m = _to_minutes(timing.start)
+        end_m = _to_minutes(timing.end)
+        if start_m is None or end_m is None:
+            continue
+        for break_start, break_end in breaks:
+            if start_m < break_end and end_m > break_start:
+                blocked.add(slot_idx)
+                break
+    return blocked
 
 
 def _saturday_inactive(req: TimetableRequest) -> bool:
@@ -93,6 +138,12 @@ class TimetableSolver:
         self.courses_by_code = {c.code: c for c in req.courses}
         self.section_ids = [s.id for s in req.sections]
         self.faculty_by_id = {f.id: f for f in req.faculty}
+        self._elective_course_codes = {
+            opt.course_code for block in req.elective_blocks for opt in block.options
+        }
+        self._combined_teaching_codes = {
+            course.code for course in req.courses if course.combined_sections
+        } | self._elective_course_codes
 
         # Reserved cells: (section, day, slot) -> label (str)
         # These cells are pre-filled (electives, activities locked, Saturday locks).
@@ -104,6 +155,15 @@ class TimetableSolver:
 
         self._tasks_by_section: dict[str, list[Task]] = defaultdict(list)
         self._break_after = _break_after(req)
+        self._blocked_slots = _blocked_slots(req)
+        self._teacher_assignment_loads: dict[str, int] = defaultdict(int)
+        self._teacher_unavailability: dict[str, set[tuple[str, int]]] = {}
+        for fac in req.faculty:
+            self._teacher_unavailability[fac.id] = {
+                (slot.day, slot.slot) for slot in fac.unavailable_slots
+            }
+            for assignment in fac.assignments:
+                self._teacher_assignment_loads[fac.id] += 1
 
         # CP model
         self.model = cp_model.CpModel()
@@ -113,11 +173,15 @@ class TimetableSolver:
 
         # All (section, day, slot, var, task) for clash/aggregation.
         # For labs, the var contributes to TWO (day, slot) cells.
-        self._cell_contrib: dict[tuple[str, str, int], list[cp_model.IntVar]] = (
+        self._cell_contrib: dict[
+            tuple[str, str, int], list[tuple[cp_model.IntVar, Task]]
+        ] = (
             defaultdict(list)
         )
         # Faculty -> list of vars active at (day, slot)
-        self._fac_contrib: dict[tuple[str, str, int], list[cp_model.IntVar]] = (
+        self._fac_contrib: dict[
+            tuple[str, str, int], list[tuple[cp_model.IntVar, Task]]
+        ] = (
             defaultdict(list)
         )
         # Lab-room -> list of vars at (day, slot)
@@ -126,6 +190,12 @@ class TimetableSolver:
         )
         # Track all (task, day, slot, var) tuples for export
         self._index: list[tuple[Task, str, int, cp_model.IntVar]] = []
+        self._section_slot_occupancy_cache: dict[
+            tuple[str, str, int], list[cp_model.IntVar]
+        ] = {}
+        self._faculty_slot_occupancy_cache: dict[
+            tuple[str, str, int], list[cp_model.IntVar]
+        ] = {}
 
     # ------------------------------------------------------------------
     # Reservations
@@ -135,13 +205,67 @@ class TimetableSolver:
         if sc.faculty_id:
             self._faculty_blocked.add((sc.faculty_id, day, slot))
 
+    def _section_slot_occupancies(self, sec_id: str, day: str, slot: int) -> list[cp_model.IntVar]:
+        key = (sec_id, day, slot)
+        cached = self._section_slot_occupancy_cache.get(key)
+        if cached is not None:
+            return cached
+
+        regular_vars: list[cp_model.IntVar] = []
+        batch_groups: dict[tuple[str, int], list[cp_model.IntVar]] = defaultdict(list)
+        for var, task in self._cell_contrib.get(key, []):
+            if task.kind == "LAB" and task.batch_id:
+                batch_groups[(task.course_code, task.session_index)].append(var)
+            else:
+                regular_vars.append(var)
+
+        occupancies = list(regular_vars)
+        for (course_code, session_index), vars_ in batch_groups.items():
+            if len(vars_) == 1:
+                occupancies.append(vars_[0])
+                continue
+            occ = self.model.NewBoolVar(
+                f"sec_occ_{sec_id}_{course_code}_{session_index}_{day}_{slot}"
+            )
+            self.model.AddMaxEquality(occ, vars_)
+            occupancies.append(occ)
+
+        self._section_slot_occupancy_cache[key] = occupancies
+        return occupancies
+
+    def _faculty_slot_occupancies(self, fac_id: str, day: str, slot: int) -> list[cp_model.IntVar]:
+        key = (fac_id, day, slot)
+        cached = self._faculty_slot_occupancy_cache.get(key)
+        if cached is not None:
+            return cached
+
+        regular_vars: list[cp_model.IntVar] = []
+        combined_groups: dict[str, list[cp_model.IntVar]] = defaultdict(list)
+        for var, task in self._fac_contrib.get(key, []):
+            if task.course_code in self._combined_teaching_codes:
+                combined_groups[task.course_code].append(var)
+            else:
+                regular_vars.append(var)
+
+        occupancies = list(regular_vars)
+        for course_code, vars_ in combined_groups.items():
+            if len(vars_) == 1:
+                occupancies.append(vars_[0])
+                continue
+            occ = self.model.NewBoolVar(f"occ_{fac_id}_{course_code}_{day}_{slot}")
+            self.model.AddMaxEquality(occ, vars_)
+            occupancies.append(occ)
+
+        self._faculty_slot_occupancy_cache[key] = occupancies
+        return occupancies
+
     def _apply_elective_blocks(self) -> None:
         """Reserve global elective slots in every applying section.
 
-        Each section gets a label-only reservation ("DMS/OT") with no faculty
-        bound. ALL faculty in the combined pool (across options) are marked
-        unavailable for those (day, slot) cells so they cannot be scheduled
-        for other teaching during the elective block.
+        Each section gets the concrete elective option assigned to it. A single
+        teacher may cover multiple sections for the same option at the same time
+        because elective teaching is modelled as combined across the section
+        group.
         """
         section_set = set(self.section_ids)
         for block in self.req.elective_blocks:
@@ -162,7 +286,66 @@ class TimetableSolver:
                     if len(globals_) >= needed:
                         break
 
-            # Per-section reservation (label only)
+            if block.options:
+                for opt in block.options:
+                    opt.assigned_sections = [sec_id for sec_id in opt.assigned_sections if sec_id in section_set]
+                missing_sections = [
+                    sec_id
+                    for sec_id in applicable
+                    if not any(sec_id in opt.assigned_sections for opt in block.options)
+                ]
+                if missing_sections:
+                    groups = even_groups(
+                        [opt.course_code for opt in block.options],
+                        applicable,
+                    )
+                    for opt in block.options:
+                        opt.assigned_sections = groups.get(opt.course_code, [])
+
+                for opt in block.options:
+                    if opt.assigned_sections and not opt.assigned_faculty_id and opt.faculty_pool:
+                        try:
+                            opt.assigned_faculty_id = assign_targets(
+                                opt.faculty_pool,
+                                [
+                                    AssignmentTarget(
+                                        section_id=",".join(opt.assigned_sections),
+                                        required_slots=slots_tuple(globals_),
+                                        load_units=len(opt.assigned_sections),
+                                        label=f"{block.name} / {opt.course_code}",
+                                    )
+                                ],
+                                self._teacher_assignment_loads,
+                                self._teacher_unavailability,
+                                {
+                                    teacher_id: self.faculty_by_id[teacher_id].name
+                                    for teacher_id in opt.faculty_pool
+                                    if teacher_id in self.faculty_by_id
+                                },
+                            )[0][1]
+                        except PoolAssignmentError as e:
+                            raise RuntimeError(str(e))
+
+                    for sec_id in opt.assigned_sections:
+                        for (day, slot) in globals_:
+                            self._reserve(
+                                sec_id,
+                                day,
+                                slot,
+                                ScheduledClass(
+                                    section_id=sec_id,
+                                    course_code=opt.course_code,
+                                    faculty_id=opt.assigned_faculty_id,
+                                    day=day,
+                                    slot=slot,
+                                    label=f"{block.name}: {opt.course_name}",
+                                ),
+                            )
+                    if opt.assigned_faculty_id:
+                        for (day, slot) in globals_:
+                            self._faculty_blocked.add((opt.assigned_faculty_id, day, slot))
+                continue
+
             for sec_id in applicable:
                 for (day, slot) in globals_:
                     self._reserve(
@@ -178,13 +361,6 @@ class TimetableSolver:
                             label=block.name,
                         ),
                     )
-            # Block ALL pool faculty across options
-            pool_ids: set[str] = set()
-            for opt in block.options:
-                pool_ids.update(opt.faculty_pool)
-            for fid in pool_ids:
-                for (day, slot) in globals_:
-                    self._faculty_blocked.add((fid, day, slot))
 
     def _apply_saturday_locks(self) -> None:
         for ls in self.tc.saturday_rules.locked_slots:
@@ -243,18 +419,23 @@ class TimetableSolver:
         Each (faculty, course, section) assignment yields tasks based on the
         course type. Courses that are part of an elective block are skipped
         (already reserved). Courses with locked_day/locked_slots are skipped.
-        Paired labs are emitted as 2 LAB tasks per pair (sessions/week).
+        Batch-aware lab assignments preserve paired-lab swap semantics when
+        batch ids are available on the upstream assignments.
         """
         elective_course_codes: set[str] = set()
         for b in self.req.elective_blocks:
             for opt in b.options:
                 elective_course_codes.add(opt.course_code)
 
-        # Index assignments by (section, course, is_lab) -> faculty_id list
-        assignment_index: dict[tuple[str, str, bool], list[str]] = defaultdict(list)
+        # Index assignments by (section, course, is_lab) -> [(faculty_id, batch_id)]
+        assignment_index: dict[
+            tuple[str, str, bool], list[tuple[str, Optional[str]]]
+        ] = defaultdict(list)
         for fac in self.req.faculty:
             for a in fac.assignments:
-                assignment_index[(a.section_id, a.course_code, a.is_lab)].append(fac.id)
+                assignment_index[(a.section_id, a.course_code, a.is_lab)].append(
+                    (fac.id, a.batch_id)
+                )
 
         # Count cells already reserved per (section, course_code) so pinned
         # classes count toward the workload and we don't schedule duplicates.
@@ -270,28 +451,82 @@ class TimetableSolver:
                     continue  # already reserved
 
                 if course.type == CourseType.LAB:
-                    fac_ids = assignment_index.get((sec.id, course.code, True)) or \
-                              assignment_index.get((sec.id, course.code, False))
-                    if not fac_ids:
+                    bindings = assignment_index.get((sec.id, course.code, True)) or assignment_index.get(
+                        (sec.id, course.code, False)
+                    )
+                    if not bindings:
                         continue
                     sessions = max(course.effective_weekly_slots() // 2, 1)
-                    for s_idx in range(sessions):
-                        self._tasks_by_section[sec.id].append(
-                            Task(
-                                section_id=sec.id,
-                                course_code=course.code,
-                                kind="LAB",
-                                width=2,
-                                quantity=1,
-                                faculty_id=fac_ids[0],
-                                paired_with=course.pair_course,
-                                lab_room=course.lab_room,
-                                label=course.name,
+                    batch_map = {
+                        batch_id: faculty_id
+                        for faculty_id, batch_id in bindings
+                        if batch_id
+                    }
+                    if not batch_map:
+                        for s_idx in range(sessions):
+                            self._tasks_by_section[sec.id].append(
+                                Task(
+                                    section_id=sec.id,
+                                    course_code=course.code,
+                                    kind="LAB",
+                                    width=2,
+                                    quantity=1,
+                                    faculty_id=bindings[0][0],
+                                    paired_with=course.pair_course,
+                                    lab_room=course.lab_room,
+                                    label=course.name,
+                                    session_index=s_idx,
+                                )
                             )
-                        )
+                        continue
+
+                    section_batch_ids = [
+                        batch.id for batch in sec.batches if batch.id in batch_map
+                    ] or list(batch_map.keys())
+
+                    if course.pair_course and len(section_batch_ids) >= 2:
+                        ordered_batches = list(section_batch_ids)
+                        if course.code > course.pair_course:
+                            ordered_batches = list(reversed(ordered_batches))
+                        for s_idx in range(sessions):
+                            batch_id = ordered_batches[s_idx % len(ordered_batches)]
+                            self._tasks_by_section[sec.id].append(
+                                Task(
+                                    section_id=sec.id,
+                                    course_code=course.code,
+                                    kind="LAB",
+                                    width=2,
+                                    quantity=1,
+                                    faculty_id=batch_map[batch_id],
+                                    batch_id=batch_id,
+                                    paired_with=course.pair_course,
+                                    lab_room=course.lab_room,
+                                    label=course.name,
+                                    session_index=s_idx,
+                                )
+                            )
+                        continue
+
+                    for s_idx in range(sessions):
+                        for batch_id in section_batch_ids:
+                            self._tasks_by_section[sec.id].append(
+                                Task(
+                                    section_id=sec.id,
+                                    course_code=course.code,
+                                    kind="LAB",
+                                    width=2,
+                                    quantity=1,
+                                    faculty_id=batch_map[batch_id],
+                                    batch_id=batch_id,
+                                    paired_with=course.pair_course,
+                                    lab_room=course.lab_room,
+                                    label=course.name,
+                                    session_index=s_idx,
+                                )
+                            )
                 elif course.type == CourseType.ACTIVITY:
-                    fac_ids = assignment_index.get((sec.id, course.code, False))
-                    fac_id = fac_ids[0] if fac_ids else None
+                    bindings = assignment_index.get((sec.id, course.code, False))
+                    fac_id = bindings[0][0] if bindings else None
                     n = course.effective_weekly_slots()
                     n -= reserved_by_sec_course.get((sec.id, course.code), 0)
                     for _ in range(max(n, 0)):
@@ -308,8 +543,8 @@ class TimetableSolver:
                             )
                         )
                 else:  # THEORY
-                    fac_ids = assignment_index.get((sec.id, course.code, False))
-                    if not fac_ids:
+                    bindings = assignment_index.get((sec.id, course.code, False))
+                    if not bindings:
                         continue
                     n = course.effective_weekly_slots()
                     n -= reserved_by_sec_course.get((sec.id, course.code), 0)
@@ -321,7 +556,7 @@ class TimetableSolver:
                                 kind="THEORY",
                                 width=1,
                                 quantity=1,
-                                faculty_id=fac_ids[0],
+                                faculty_id=bindings[0][0],
                                 label=course.name,
                             )
                         )
@@ -341,11 +576,15 @@ class TimetableSolver:
                     if d == "SAT":
                         continue
                     for t in self.slots:
+                        if t in self._blocked_slots:
+                            continue
                         if task.width == 2:
                             # Lab start: t and t+1 must both be valid and not span a break.
                             if t + 1 not in self.slots:
                                 continue
                             if t in self._break_after:
+                                continue
+                            if t + 1 in self._blocked_slots:
                                 continue
                             # Both cells must be free of reservation.
                             if (sec_id, d, t) in self._reserved:
@@ -362,17 +601,15 @@ class TimetableSolver:
                             continue
                         # Faculty unavailability
                         if task.faculty_id:
-                            fac = self.faculty_by_id.get(task.faculty_id)
-                            if fac:
-                                if (task.faculty_id, d, t) in self._faculty_blocked:
-                                    continue
-                                if task.width == 2 and (task.faculty_id, d, t + 1) in self._faculty_blocked:
-                                    continue
-                                unav = {(u.day, u.slot) for u in fac.unavailable_slots}
-                                if (d, t) in unav:
-                                    continue
-                                if task.width == 2 and (d, t + 1) in unav:
-                                    continue
+                            if (task.faculty_id, d, t) in self._faculty_blocked:
+                                continue
+                            if task.width == 2 and (task.faculty_id, d, t + 1) in self._faculty_blocked:
+                                continue
+                            unav = self._teacher_unavailability.get(task.faculty_id, set())
+                            if (d, t) in unav:
+                                continue
+                            if task.width == 2 and (d, t + 1) in unav:
+                                continue
                         v = self.model.NewBoolVar(f"x_{sec_id}_{task.course_code}_{idx}_{d}_{t}")
                         var_map[(d, t)] = v
                         # Cell contributions. For PAIRED labs only the
@@ -385,14 +622,14 @@ class TimetableSolver:
                             and task.course_code > task.paired_with
                         )
                         if contributes_to_cell:
-                            self._cell_contrib[(sec_id, d, t)].append(v)
+                            self._cell_contrib[(sec_id, d, t)].append((v, task))
                             if task.width == 2:
-                                self._cell_contrib[(sec_id, d, t + 1)].append(v)
+                                self._cell_contrib[(sec_id, d, t + 1)].append((v, task))
                         # Faculty contributions
                         if task.faculty_id:
-                            self._fac_contrib[(task.faculty_id, d, t)].append(v)
+                            self._fac_contrib[(task.faculty_id, d, t)].append((v, task))
                             if task.width == 2:
-                                self._fac_contrib[(task.faculty_id, d, t + 1)].append(v)
+                                self._fac_contrib[(task.faculty_id, d, t + 1)].append((v, task))
                         # Room contributions
                         if task.lab_room:
                             self._room_contrib[(task.lab_room, d, t)].append(v)
@@ -414,15 +651,18 @@ class TimetableSolver:
             self.model.Add(sum(var_map.values()) == 1)
 
         # H2: section no-clash. Reserved cells already consume the slot;
-        # for non-reserved cells, at most 1 task may occupy it.
-        for (sec_id, d, t), vars_ in self._cell_contrib.items():
-            self.model.Add(sum(vars_) <= 1)
+        # for non-reserved cells, at most 1 visible course may occupy it.
+        for (sec_id, d, t) in self._cell_contrib:
+            occupancies = self._section_slot_occupancies(sec_id, d, t)
+            if occupancies:
+                self.model.Add(sum(occupancies) <= 1)
 
-        # H1: faculty no-clash. At most 1 simultaneous placement per faculty.
-        # Pre-blocked cells are filtered at variable creation; for combinations,
-        # at most 1 task var per (faculty, day, slot).
-        for (_fid, _d, _t), vars_ in self._fac_contrib.items():
-            self.model.Add(sum(vars_) <= 1)
+        # H1: faculty no-clash. Combined teaching codes (dept activities,
+        # electives, etc.) count as one occupancy across sections.
+        for (fid, d, t) in self._fac_contrib:
+            occupancies = self._faculty_slot_occupancies(fid, d, t)
+            if occupancies:
+                self.model.Add(sum(occupancies) <= 1)
 
         # H6: lab room contention.
         for (_room, _d, _t), vars_ in self._room_contrib.items():
@@ -431,35 +671,52 @@ class TimetableSolver:
         # H4 lab consecutiveness / no spanning break is enforced at variable
         # creation (lab vars only exist for legal start slots).
 
+        # Multi-batch unpaired labs represent one visible lab session in the
+        # section grid, so all batches of the same session must align.
+        by_lab_session: dict[tuple[str, str, int], list[dict[tuple[str, int], cp_model.IntVar]]] = defaultdict(list)
+        for task, vm in self._task_vars:
+            if task.kind != "LAB" or not task.batch_id or task.paired_with:
+                continue
+            by_lab_session[(task.section_id, task.course_code, task.session_index)].append(vm)
+        for (_sec, _code, _session), vms in by_lab_session.items():
+            if len(vms) < 2:
+                continue
+            anchor = vms[0]
+            keys = set().union(*(vm.keys() for vm in vms))
+            for vm in vms[1:]:
+                for k in keys:
+                    a_v = anchor.get(k)
+                    b_v = vm.get(k)
+                    if a_v is not None and b_v is not None:
+                        self.model.Add(a_v == b_v)
+                    elif a_v is not None and b_v is None:
+                        self.model.Add(a_v == 0)
+                    elif b_v is not None and a_v is None:
+                        self.model.Add(b_v == 0)
+
         # H5: paired labs must run at the same (day, slot) within a section
         # for each pair index, AND on different days across pair sessions.
-        # We have multiple LAB tasks per course; pair them by index.
         for sec_id in self.section_ids:
-            # group tasks by paired-set: (frozenset(course, paired_with))
-            paired_groups: dict[frozenset, list[tuple[Task, dict]]] = defaultdict(list)
+            paired_groups: dict[frozenset[str], list[tuple[Task, dict[tuple[str, int], cp_model.IntVar]]]] = defaultdict(list)
             for task, vm in self._task_vars:
                 if task.section_id != sec_id or task.kind != "LAB":
                     continue
                 if task.paired_with:
                     key = frozenset({task.course_code, task.paired_with})
                     paired_groups[key].append((task, vm))
-            for key, group in paired_groups.items():
-                # Split group by course code
-                by_code: dict[str, list[tuple[Task, dict]]] = defaultdict(list)
-                for t_, vm in group:
-                    by_code[t_.course_code].append((t_, vm))
+            for group in paired_groups.values():
+                by_code: dict[str, list[tuple[Task, dict[tuple[str, int], cp_model.IntVar]]]] = defaultdict(list)
+                for task, vm in group:
+                    by_code[task.course_code].append((task, vm))
                 codes = list(by_code.keys())
                 if len(codes) != 2:
-                    continue  # only enforce true pairs
-                a_list = by_code[codes[0]]
-                b_list = by_code[codes[1]]
+                    continue
+                a_list = sorted(by_code[codes[0]], key=lambda item: item[0].session_index)
+                b_list = sorted(by_code[codes[1]], key=lambda item: item[0].session_index)
                 n = min(len(a_list), len(b_list))
-                # Pair them up: session i of A aligns with session i of B at same (d,t)
                 for i in range(n):
-                    a_task, a_vm = a_list[i]
-                    b_task, b_vm = b_list[i]
-                    common_keys = set(a_vm.keys()) & set(b_vm.keys())
-                    # For each (d, t): a_vm[(d,t)] == b_vm[(d,t)]
+                    _a_task, a_vm = a_list[i]
+                    _b_task, b_vm = b_list[i]
                     for k in set(a_vm.keys()) | set(b_vm.keys()):
                         a_v = a_vm.get(k)
                         b_v = b_vm.get(k)
@@ -498,9 +755,9 @@ class TimetableSolver:
                     continue
                 if (sec_id, d, 1) in self._reserved:
                     continue
-                cell_vars = self._cell_contrib.get((sec_id, d, 1), [])
-                if cell_vars:
-                    self.model.Add(sum(cell_vars) >= 1)
+                occupancies = self._section_slot_occupancies(sec_id, d, 1)
+                if occupancies:
+                    self.model.Add(sum(occupancies) >= 1)
 
         # Faculty max_per_day (H + soft hybrid)
         for fac in self.req.faculty:
@@ -510,7 +767,7 @@ class TimetableSolver:
             for d in self.days:
                 day_vars: list[cp_model.IntVar] = []
                 for t in self.slots:
-                    day_vars.extend(self._fac_contrib.get((fac.id, d, t), []))
+                    day_vars.extend(self._faculty_slot_occupancies(fac.id, d, t))
                 if day_vars:
                     self.model.Add(sum(day_vars) <= cap)
 
@@ -561,12 +818,12 @@ class TimetableSolver:
         if post_lunch in self.slots:
             for sec_id in self.section_ids:
                 for d in self.days:
-                    cell_vars = self._cell_contrib.get((sec_id, d, post_lunch), [])
-                    if not cell_vars:
+                    occupancies = self._section_slot_occupancies(sec_id, d, post_lunch)
+                    if not occupancies:
                         continue
                     # penalty if any class lands there (small)
                     pen = self.model.NewIntVar(0, 1, f"s3_{sec_id}_{d}")
-                    self.model.Add(sum(cell_vars) <= pen)
+                    self.model.Add(sum(occupancies) <= pen)
                     penalties.append(self._scale(pen, 5))
 
         # S6: activities prefer afternoon (slot >= post_lunch)
@@ -589,7 +846,7 @@ class TimetableSolver:
             for d in self.days:
                 day_vars: list[cp_model.IntVar] = []
                 for t in self.slots:
-                    day_vars.extend(self._fac_contrib.get((fac.id, d, t), []))
+                    day_vars.extend(self._faculty_slot_occupancies(fac.id, d, t))
                 if not day_vars:
                     continue
                 load = self.model.NewIntVar(0, len(day_vars), f"load_{fac.id}_{d}")
