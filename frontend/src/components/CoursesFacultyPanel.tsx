@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import {
   type CourseDraft,
   type CourseKind,
@@ -13,6 +13,26 @@ interface PreviewSummary {
   courses: number
   faculty: number
   elective_blocks: number
+}
+
+interface ImportDocumentInfo {
+  filename: string
+  format: string
+  course_rows: number
+  faculty_rows: number
+  warnings: string[]
+}
+
+interface ImportResponse {
+  raw_text: string
+  summary: {
+    documents: number
+    courses: number
+    imported_courses: number
+    faculty_mappings: number
+  }
+  documents_info: ImportDocumentInfo[]
+  warnings: string[]
 }
 
 interface Props {
@@ -92,7 +112,11 @@ export default function CoursesFacultyPanel({
   preflightErrors,
   busy = false,
 }: Props) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [mode, setMode] = useState<EditorMode>('guided')
+  const [importBusy, setImportBusy] = useState(false)
+  const [importError, setImportError] = useState<string | null>(null)
+  const [importResult, setImportResult] = useState<ImportResponse | null>(null)
 
   const parsed = useMemo(() => {
     try {
@@ -153,6 +177,45 @@ export default function CoursesFacultyPanel({
     commitRows([...parsed.rows, createStarterCourse(kind, parsed.rows.length + 1)])
   }
 
+  async function handleFileSelection(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? [])
+    event.target.value = ''
+    if (files.length === 0) return
+
+    setImportBusy(true)
+    setImportError(null)
+
+    try {
+      const body = new FormData()
+      for (const file of files) body.append('files', file)
+      body.append('section_ids', sectionIds.join(','))
+      body.append('existing_text', rawText)
+      body.append('replace_existing', 'true')
+
+      const response = await fetch('/api/draft/import-documents', {
+        method: 'POST',
+        body,
+      })
+
+      const payload = await response.json().catch(async () => {
+        throw new Error(await response.text())
+      })
+
+      if (!response.ok || !payload?.ok) {
+        throw new Error(payload?.detail || payload?.error || 'Document import failed.')
+      }
+
+      const result = payload as ImportResponse & { ok: true }
+      onChange(result.raw_text)
+      setImportResult(result)
+      setMode('guided')
+    } catch (err) {
+      setImportError(err instanceof Error ? err.message : 'Document import failed.')
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
   const rawLineCount = rawText
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -180,10 +243,26 @@ export default function CoursesFacultyPanel({
                   Raw text
                 </ModeButton>
               </div>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                onChange={handleFileSelection}
+                className="hidden"
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={busy || importBusy}
+                className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
+              >
+                {importBusy ? 'Importing...' : 'Import PDF/DOCX'}
+              </button>
               <button
                 type="button"
                 onClick={onPreview}
-                disabled={busy}
+                disabled={busy || importBusy}
                 className="rounded-md bg-slate-900 px-3 py-2 text-xs font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
               >
                 {busy ? 'Previewing...' : 'Preview'}
@@ -198,6 +277,10 @@ export default function CoursesFacultyPanel({
             <StatPill label={`${stats.activity} activities`} tone="amber" />
             <StatPill label={`${sectionIds.length} sections`} tone="emerald" />
             <StatPill label={`${rawLineCount} non-empty lines`} tone="slate" />
+          </div>
+          <div className="mt-3 text-[11px] leading-5 text-slate-500">
+            Upload one or more subject/faculty documents. The importer reads `pdf` and `docx`,
+            merges the recognised course and faculty rows, and replaces the current Step 2 text.
           </div>
         </div>
 
@@ -289,6 +372,43 @@ export default function CoursesFacultyPanel({
           )}
         </div>
       </div>
+
+      {(importResult || importError) && (
+        <div className="space-y-3">
+          {importResult && (
+            <div className="rounded-md border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+              Imported <b>{importResult.summary.documents}</b> file(s) into <b>{importResult.summary.courses}</b>{' '}
+              course row(s). New rows: <b>{importResult.summary.imported_courses}</b>. Faculty mappings:{' '}
+              <b>{importResult.summary.faculty_mappings}</b>.
+              {importResult.documents_info.length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {importResult.documents_info.map((doc) => (
+                    <div key={`${doc.filename}-${doc.format}`}>
+                      <span className="font-medium">{doc.filename}</span>: {doc.course_rows} recognised row(s),{' '}
+                      {doc.faculty_rows} faculty mapping row(s)
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {importError && (
+            <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900">
+              {importError}
+            </div>
+          )}
+          {importResult?.warnings?.length ? (
+            <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+              <div className="font-semibold">Import warnings</div>
+              <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                {importResult.warnings.slice(0, 6).map((warning, index) => (
+                  <li key={index}>{warning}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </div>
+      )}
 
       {preview && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-900">

@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -165,6 +165,41 @@ class DraftBuildRequest(BaseModel):
     courses_text: str
     elective_blocks: list[dict] = []  # passed straight to builder
     time_limit_sec: int = 60
+
+
+@app.post("/draft/import-documents")
+async def draft_import_documents(
+    files: list[UploadFile] = File(...),
+    existing_text: str = Form(""),
+    section_ids: str = Form(""),
+    replace_existing: bool = Form(True),
+) -> dict:
+    """Extract course/faculty data from uploaded PDF/DOCX files into Step 2 text."""
+    from .draft.import_docs import import_course_documents
+
+    uploaded: list[tuple[str, bytes]] = []
+    for file in files:
+        name = file.filename or "document"
+        payload = await file.read()
+        if not payload:
+            continue
+        uploaded.append((name, payload))
+    if not uploaded:
+        raise HTTPException(400, "No files were uploaded.")
+
+    parsed_section_ids = [part.strip() for part in section_ids.split(",") if part.strip()]
+    try:
+        result = import_course_documents(
+            uploaded,
+            section_ids=parsed_section_ids,
+            existing_text=existing_text,
+            replace_existing=replace_existing,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Document import failed: {str(e)[:200]}")
+    return {"ok": True, **result}
 
 
 @app.post("/draft/preview")
