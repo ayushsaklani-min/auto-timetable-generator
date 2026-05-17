@@ -54,6 +54,12 @@ export interface Faculty {
   assignments: { course_code: string; section_id: string; is_lab: boolean }[]
 }
 
+export interface Course {
+  code: string
+  name: string
+  credits: number
+}
+
 export interface TimetableRequest {
   time_config: {
     days: string[]
@@ -67,7 +73,7 @@ export interface TimetableRequest {
     }
   }
   sections: Section[]
-  courses: any[]
+  courses: Course[]
   faculty: Faculty[]
   elective_blocks: any[]
   time_limit_sec: number

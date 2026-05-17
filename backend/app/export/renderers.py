@@ -5,12 +5,13 @@ import io
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import (
     PageBreak,
     Paragraph,
@@ -52,6 +53,10 @@ def _slot_timing(req: TimetableRequest, t: int) -> str:
     return ""
 
 
+def _cell_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
+    return Paragraph(escape(text).replace("\n", "<br/>"), style)
+
+
 # ---------------------------------------------------------------------------
 # Grid building
 # ---------------------------------------------------------------------------
@@ -78,6 +83,71 @@ def _faculty_grid(tt: Timetable, faculty_id: str, days: list[str], slots: list[i
         if text not in cell:
             cell.append(text)
     return grid
+
+
+def _section_faculty_rows(req: TimetableRequest, tt: Timetable, sec_id: str) -> list[dict[str, str]]:
+    course_by_code = {c.code: c for c in req.courses}
+    faculty_by_id = {f.id: f.name for f in req.faculty}
+    block_by_id = {b.id: b for b in req.elective_blocks}
+    type_rank = {"THEORY": 0, "LAB": 1, "ACTIVITY": 2}
+    rows: dict[str, dict] = {}
+
+    def upsert(course_code: str, fallback_name: str | None = None) -> dict:
+        course = course_by_code.get(course_code)
+        course_name = course.name if course else (fallback_name or course_code)
+        credits = str(course.credits) if course else "—"
+        if course_code not in rows:
+            rank = type_rank.get(course.type.value, 3) if course else 4
+            rows[course_code] = {
+                "course_name": course_name,
+                "course_code": course_code,
+                "credits": credits,
+                "faculty": set(),
+                "rank": rank,
+            }
+        return rows[course_code]
+
+    for fac in req.faculty:
+        for assign in fac.assignments:
+            if assign.section_id != sec_id:
+                continue
+            entry = upsert(assign.course_code)
+            entry["faculty"].add(fac.name)
+
+    section_classes = [c for c in tt.classes if c.section_id == sec_id]
+    elective_block_ids = {
+        c.course_code for c in section_classes if c.course_code.startswith("ELEC_BLOCK_")
+    }
+    for block_id in elective_block_ids:
+        block = block_by_id.get(block_id)
+        if not block:
+            continue
+        for opt in block.options:
+            entry = upsert(opt.course_code, opt.course_name)
+            for fid in opt.faculty_pool:
+                name = faculty_by_id.get(fid)
+                if name:
+                    entry["faculty"].add(name)
+
+    for c in section_classes:
+        if c.course_code.startswith("ELEC_BLOCK_"):
+            continue
+        entry = upsert(c.course_code, c.label)
+        if c.faculty_id:
+            entry["faculty"].add(faculty_by_id.get(c.faculty_id, c.faculty_id))
+
+    out: list[dict[str, str]] = []
+    for row in sorted(rows.values(), key=lambda r: (r["rank"], r["course_name"])):
+        faculty_names = ", ".join(sorted(row["faculty"])) if row["faculty"] else "—"
+        out.append(
+            {
+                "course_name": row["course_name"],
+                "course_code": row["course_code"],
+                "credits": row["credits"],
+                "faculty": faculty_names,
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +188,73 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
     AMBER_SOFT = colors.HexColor("#FCE9B6")
     NAVY = colors.HexColor("#0E2447")
     INK = colors.HexColor("#161412")
+    header_style = ParagraphStyle(
+        "TimetableHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=9,
+        alignment=1,  # center
+        textColor=colors.whitesmoke,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    day_style = ParagraphStyle(
+        "TimetableDay",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=9,
+        alignment=1,
+        textColor=NAVY,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    body_style = ParagraphStyle(
+        "TimetableBody",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.4,
+        leading=9,
+        alignment=1,
+        wordWrap="CJK",
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    break_style = ParagraphStyle(
+        "TimetableBreak",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=10,
+        alignment=1,
+        textColor=INK,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    faculty_header_style = ParagraphStyle(
+        "FacultyHeader",
+        parent=styles["Normal"],
+        fontName="Helvetica-Bold",
+        fontSize=8,
+        leading=9,
+        alignment=1,
+        textColor=INK,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+    faculty_body_style = ParagraphStyle(
+        "FacultyBody",
+        parent=styles["Normal"],
+        fontName="Helvetica",
+        fontSize=7.4,
+        leading=9,
+        alignment=1,
+        wordWrap="CJK",
+        textColor=INK,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
 
     for sec in req.sections:
         elements.append(
@@ -129,18 +266,18 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
         elements.append(Spacer(1, 4))
 
         # Header row: Day | (Slot N + timing) ... | BREAK label ...
-        header: list = ["Day"]
+        header: list = [_cell_paragraph("Day", header_style)]
         for c in cols:
             if c["kind"] == "slot":
                 t = c["slot"]
-                header.append(f"Slot {t}\n{_slot_timing(req, t)}")
+                header.append(_cell_paragraph(f"Slot {t}\n{_slot_timing(req, t)}", header_style))
             else:
-                header.append(c["label"])
+                header.append(_cell_paragraph(c["label"], break_style))
 
         grid = _section_grid(tt, sec.id, days, slots)
         data = [header]
         for d in days:
-            row: list = [d]
+            row: list = [_cell_paragraph(d, day_style)]
             for c in cols:
                 if c["kind"] == "break":
                     row.append("")  # body of break column is empty; spanned by header
@@ -148,9 +285,9 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
                 t = c["slot"]
                 cell = grid.get((d, t))
                 if cell:
-                    row.append("\n".join(cell))
+                    row.append(_cell_paragraph("\n".join(cell), body_style))
                 else:
-                    row.append("—" if d == "SAT" else "")
+                    row.append(_cell_paragraph("—" if d == "SAT" else "", body_style))
             data.append(row)
 
         style_cmds: list = [
@@ -164,6 +301,10 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
             ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9CCAA")),
+            ("LEFTPADDING", (0, 0), (-1, -1), 2),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.HexColor("#FFFBED"), colors.white]),
             # Day column emphasis
             ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#F0E5C9")),
@@ -186,7 +327,7 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
             raw = cols[bc - 1]["label"]  # e.g., "TEA BREAK"
             duration = cols[bc - 1]["duration"]
             # Stack as two short lines + duration, all fit in 1.5cm.
-            data[0][bc] = raw.replace(" ", "\n") + f"\n{duration} min"
+            data[0][bc] = _cell_paragraph(raw.replace(" ", "\n") + f"\n{duration} min", break_style)
 
         tbl = Table(data, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
         tbl.setStyle(TableStyle(style_cmds))
@@ -206,6 +347,56 @@ def render_pdf(req: TimetableRequest, tt: Timetable) -> bytes:
                 styles["Normal"],
             )
         )
+
+        faculty_rows = _section_faculty_rows(req, tt, sec.id)
+        if faculty_rows:
+            elements.append(Spacer(1, 8))
+            elements.append(Paragraph("<b>Faculty Allocation</b>", styles["Heading4"]))
+            elements.append(Spacer(1, 4))
+            faculty_data = [
+                [
+                    _cell_paragraph("Course Name", faculty_header_style),
+                    _cell_paragraph("Course Code", faculty_header_style),
+                    _cell_paragraph("Credits", faculty_header_style),
+                    _cell_paragraph("Faculty", faculty_header_style),
+                ]
+            ]
+            for row in faculty_rows:
+                faculty_data.append(
+                    [
+                        _cell_paragraph(row["course_name"], faculty_body_style),
+                        _cell_paragraph(row["course_code"], faculty_body_style),
+                        _cell_paragraph(row["credits"], faculty_body_style),
+                        _cell_paragraph(row["faculty"], faculty_body_style),
+                    ]
+                )
+
+            faculty_col_widths = [6.2 * cm, 2.6 * cm, 1.6 * cm, page_w - (10.4 * cm)]
+            fac_tbl = Table(
+                faculty_data,
+                colWidths=faculty_col_widths,
+                repeatRows=1,
+                hAlign="LEFT",
+            )
+            fac_tbl.setStyle(
+                TableStyle(
+                    [
+                        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9CCAA")),
+                        ("BACKGROUND", (0, 0), (-1, 0), AMBER_SOFT),
+                        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 2),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 2),
+                        ("TOPPADDING", (0, 0), (-1, -1), 2),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#FFFBED")]),
+                        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+                        ("ALIGN", (1, 1), (2, -1), "CENTER"),
+                        ("ALIGN", (0, 1), (0, -1), "LEFT"),
+                        ("ALIGN", (3, 1), (3, -1), "LEFT"),
+                    ]
+                )
+            )
+            elements.append(fac_tbl)
         elements.append(PageBreak())
 
     if not elements:

@@ -1,9 +1,77 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, GenerateResponse, TimetableRequest, Violation } from './lib/api'
+import { api, Faculty, GenerateResponse, ScheduledClass, TimetableRequest, Violation } from './lib/api'
 import TimetableGrid from './components/TimetableGrid'
 import ChatPanel from './components/ChatPanel'
 import SetupWizard from './components/SetupWizard'
 import LandingPage from './components/LandingPage'
+
+function baseFacultyName(name: string) {
+  return name.replace(/\s*\([^)]*\)\s*$/, '').trim() || name
+}
+
+function inferClassesForFaculty(
+  req: TimetableRequest,
+  classes: ScheduledClass[],
+  facultyIds: string[],
+): ScheduledClass[] {
+  const idSet = new Set(facultyIds)
+  const byId = new Map<string, Faculty>(req.faculty.map((f) => [f.id, f]))
+  const selected = facultyIds.map((id) => byId.get(id)).filter((f): f is Faculty => !!f)
+  const out: ScheduledClass[] = []
+  const seen = new Set<string>()
+
+  const pushUnique = (c: ScheduledClass) => {
+    const key = `${c.section_id}|${c.day}|${c.slot}|${c.course_code}|${c.label ?? ''}|${c.batch_id ?? ''}`
+    if (seen.has(key)) return
+    seen.add(key)
+    out.push(c)
+  }
+
+  for (const c of classes) {
+    if (c.faculty_id && idSet.has(c.faculty_id)) pushUnique(c)
+  }
+
+  for (const fac of selected) {
+    for (const a of fac.assignments ?? []) {
+      for (const c of classes) {
+        if (c.course_code === a.course_code && c.section_id === a.section_id) pushUnique(c)
+      }
+    }
+  }
+
+  for (const block of req.elective_blocks ?? []) {
+    if (!block?.id || !Array.isArray(block.options)) continue
+    for (const opt of block.options) {
+      const pool = Array.isArray(opt?.faculty_pool) ? (opt.faculty_pool as string[]) : []
+      if (!pool.some((id) => idSet.has(id))) continue
+      for (const c of classes) {
+        if (c.course_code !== block.id) continue
+        if (Array.isArray(block.applies_to_sections) && !block.applies_to_sections.includes(c.section_id))
+          continue
+        pushUnique({
+          ...c,
+          course_code: opt.course_code || c.course_code,
+          label: opt.course_name || c.label || c.course_code,
+        })
+      }
+    }
+  }
+
+  const lowerNames = selected.map((f) => f.name.toLowerCase())
+  const wantsIIC = lowerNames.some((n) => n.includes('iic'))
+  const wantsBeng = lowerNames.some((n) => n.includes('bengdip2'))
+  if (wantsIIC || wantsBeng) {
+    for (const c of classes) {
+      const code = (c.course_code || '').toLowerCase()
+      const label = (c.label || '').toLowerCase()
+      if ((wantsIIC && (code.includes('iic') || label.includes('iic'))) || (wantsBeng && (code.includes('bengdip2') || label.includes('bengdip2')))) {
+        pushUnique(c)
+      }
+    }
+  }
+
+  return out
+}
 
 export default function App() {
   const [req, setReq] = useState<TimetableRequest | null>(null)
@@ -13,7 +81,8 @@ export default function App() {
   const [statusMsg, setStatusMsg] = useState<string>('')
   const [highlightCourse, setHighlightCourse] = useState<string | null>(null)
   const [view, setView] = useState<'section' | 'faculty'>('section')
-  const [facultyId, setFacultyId] = useState<string>('')
+  const [facultyKey, setFacultyKey] = useState<string>('')
+  const [facultyCourse, setFacultyCourse] = useState<string>('ALL')
   const [wizardOpen, setWizardOpen] = useState(false)
   const [landing, setLanding] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true
@@ -26,7 +95,6 @@ export default function App() {
       .then((r) => {
         setReq(r)
         setSectionId(r.sections[0]?.id ?? 'A')
-        setFacultyId(r.faculty[0]?.id ?? '')
       })
       .catch((e) => setStatusMsg(`Load failed: ${e.message}`))
   }, [])
@@ -55,12 +123,71 @@ export default function App() {
     }
   }
 
+  const courseNameByCode = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const c of req?.courses ?? []) m.set(c.code, c.name)
+    return m
+  }, [req])
+
+  const facultyGroups = useMemo(() => {
+    if (!req) return []
+    const grouped = new Map<string, { key: string; name: string; ids: string[] }>()
+    for (const f of req.faculty) {
+      const key = baseFacultyName(f.name)
+      const existing = grouped.get(key)
+      if (existing) existing.ids.push(f.id)
+      else grouped.set(key, { key, name: key, ids: [f.id] })
+    }
+    const all = [...grouped.values()].sort((a, b) => a.name.localeCompare(b.name))
+    if (!resp?.timetable) return all
+    return all.filter((g) => inferClassesForFaculty(req, resp.timetable!.classes, g.ids).length > 0)
+  }, [req, resp])
+
+  useEffect(() => {
+    if (facultyGroups.length === 0) {
+      if (facultyKey) setFacultyKey('')
+      return
+    }
+    if (!facultyGroups.some((f) => f.key === facultyKey)) setFacultyKey(facultyGroups[0].key)
+  }, [facultyGroups, facultyKey])
+
+  const selectedFaculty = useMemo(
+    () => facultyGroups.find((f) => f.key === facultyKey) ?? null,
+    [facultyGroups, facultyKey],
+  )
+
+  const facultyRawClasses = useMemo(() => {
+    if (!req || !resp?.timetable || !selectedFaculty) return []
+    return inferClassesForFaculty(req, resp.timetable.classes, selectedFaculty.ids)
+  }, [req, resp, selectedFaculty])
+
+  const facultyCourseOptions = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const c of facultyRawClasses) {
+      m.set(c.course_code, c.label || courseNameByCode.get(c.course_code) || c.course_code)
+    }
+    return [...m.entries()]
+      .map(([code, name]) => ({ code, name }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }, [facultyRawClasses, courseNameByCode])
+
+  useEffect(() => {
+    if (facultyCourse === 'ALL') return
+    if (!facultyCourseOptions.some((c) => c.code === facultyCourse)) setFacultyCourse('ALL')
+  }, [facultyCourse, facultyCourseOptions])
+
   const facultyClasses = useMemo(() => {
-    if (!resp?.timetable) return []
-    return resp.timetable.classes
-      .filter((c) => c.faculty_id === facultyId)
-      .map((c) => ({ ...c, section_id: '_FAC' }))
-  }, [resp, facultyId])
+    const filtered =
+      facultyCourse === 'ALL'
+        ? facultyRawClasses
+        : facultyRawClasses.filter((c) => c.course_code === facultyCourse)
+    return filtered.map((c) => ({
+      ...c,
+      section_id: '_FAC',
+      label: c.label || courseNameByCode.get(c.course_code) || c.course_code,
+      faculty_id: c.section_id,
+    }))
+  }, [facultyRawClasses, facultyCourse, courseNameByCode])
 
   const status = resp?.timetable?.status
   const statusColor =
@@ -164,7 +291,6 @@ export default function App() {
             setReq(newReq)
             setResp(newResp)
             setSectionId(newReq.sections[0]?.id ?? 'A')
-            setFacultyId(newReq.faculty[0]?.id ?? '')
             const tt = newResp.timetable
             if (tt) {
               setStatusMsg(
@@ -246,17 +372,35 @@ export default function App() {
               </select>
             )}
             {view === 'faculty' && req && (
-              <select
-                value={facultyId}
-                onChange={(e) => setFacultyId(e.target.value)}
-                className="border border-slate-200 rounded-md px-2 py-1 bg-white text-xs"
-              >
-                {req.faculty.map((f) => (
-                  <option key={f.id} value={f.id}>
-                    {f.name}
-                  </option>
-                ))}
-              </select>
+              <>
+                <select
+                  value={facultyKey}
+                  onChange={(e) => {
+                    setFacultyKey(e.target.value)
+                    setFacultyCourse('ALL')
+                  }}
+                  className="border border-slate-200 rounded-md px-2 py-1 bg-white text-xs"
+                >
+                  {facultyGroups.map((f) => (
+                    <option key={f.key} value={f.key}>
+                      {f.name}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={facultyCourse}
+                  onChange={(e) => setFacultyCourse(e.target.value)}
+                  className="border border-slate-200 rounded-md px-2 py-1 bg-white text-xs"
+                  disabled={facultyCourseOptions.length === 0}
+                >
+                  <option value="ALL">All courses</option>
+                  {facultyCourseOptions.map((c) => (
+                    <option key={c.code} value={c.code}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </>
             )}
             <input
               type="text"
@@ -307,6 +451,22 @@ export default function App() {
               </div>
               <div className="text-[11px] text-slate-500">
                 Active days: {req.time_config.days.join(' · ')} · {req.time_config.slots_per_day} slots/day
+              </div>
+            </div>
+          )}
+          {view === 'faculty' && req && (
+            <div className="px-4 py-2 border-b border-slate-200 bg-white">
+              <div className="font-semibold text-slate-800">
+                {selectedFaculty?.name || 'Faculty view'}
+                {facultyCourse !== 'ALL' && (
+                  <span className="text-slate-500 font-normal">
+                    {' '}
+                    · {facultyCourseOptions.find((c) => c.code === facultyCourse)?.name ?? facultyCourse}
+                  </span>
+                )}
+              </div>
+              <div className="text-[11px] text-slate-500">
+                Slots shown: {facultyClasses.length} · Cells display section-wise teaching
               </div>
             </div>
           )}
