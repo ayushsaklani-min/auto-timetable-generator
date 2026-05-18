@@ -57,7 +57,7 @@ function parseFacultySpec(spec: string): Pick<CourseDraft, 'facultyMode' | 'facu
   const trimmed = spec.trim()
   if (!trimmed) {
     return {
-      facultyMode: 'sections',
+      facultyMode: 'auto',
       facultyNames: [],
       facultyCount: 1,
       sameAsCode: '',
