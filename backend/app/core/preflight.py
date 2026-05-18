@@ -116,6 +116,7 @@ def validate(req: TimetableRequest) -> PreflightReport:
     courses_by_code = {c.code: c for c in req.courses}
 
     # Faculty assignment sanity
+    faculty_name_by_id = {f.id: f.name for f in req.faculty}
     for fac in req.faculty:
         for asn in fac.assignments:
             if asn.course_code not in courses_by_code:
@@ -126,6 +127,75 @@ def validate(req: TimetableRequest) -> PreflightReport:
                 errors.append(
                     f"Faculty {fac.name} assigned to unknown section {asn.section_id}"
                 )
+
+    # Deterministic clash guard: unpaired labs with per-batch assignments must not
+    # map multiple batches in one section to the same faculty (they are aligned
+    # to run concurrently by the solver).
+    sec_batches = {
+        sec.id: {b.id for b in sec.batches}
+        for sec in req.sections
+    }
+    by_course_sec: dict[tuple[str, str], list[tuple[str, str | None]]] = defaultdict(list)
+    for fac in req.faculty:
+        for asn in fac.assignments:
+            by_course_sec[(asn.course_code, asn.section_id)].append((fac.id, asn.batch_id))
+
+    for course in req.courses:
+        if course.type != CourseType.LAB or course.pair_course:
+            continue
+        for sec in req.sections:
+            pairs = by_course_sec.get((course.code, sec.id), [])
+            if not pairs:
+                continue
+            batch_to_fac = {
+                batch_id: fac_id
+                for fac_id, batch_id in pairs
+                if batch_id and batch_id in sec_batches.get(sec.id, set())
+            }
+            if len(batch_to_fac) < 2:
+                continue
+            if len(set(batch_to_fac.values())) == len(batch_to_fac):
+                continue
+            seen_fac: dict[str, list[str]] = defaultdict(list)
+            for batch_id, fac_id in batch_to_fac.items():
+                seen_fac[fac_id].append(batch_id)
+            clashes = [
+                f"{faculty_name_by_id.get(fac_id, fac_id)} -> {sorted(batches)}"
+                for fac_id, batches in seen_fac.items()
+                if len(batches) > 1
+            ]
+            errors.append(
+                f"Lab {course.code} section {sec.id}: same faculty assigned to "
+                f"multiple batches ({'; '.join(clashes)}). Use distinct faculty "
+                "per batch (e.g., auto or xN) or remove explicit batch mapping."
+            )
+
+    # Deterministic clash guard: locked courses with one faculty across multiple
+    # sections must be marked combined_sections=True, otherwise H1 can never hold.
+    for course in req.courses:
+        if not (course.locked_day and course.locked_slots) or course.combined_sections:
+            continue
+        fac_to_sections: dict[str, set[str]] = defaultdict(set)
+        for fac in req.faculty:
+            for asn in fac.assignments:
+                if asn.course_code == course.code:
+                    fac_to_sections[fac.id].add(asn.section_id)
+        bad = {
+            fac_id: secs
+            for fac_id, secs in fac_to_sections.items()
+            if len(secs) > 1
+        }
+        if not bad:
+            continue
+        detail = ", ".join(
+            f"{faculty_name_by_id.get(fid, fid)} -> {sorted(secs)}"
+            for fid, secs in bad.items()
+        )
+        errors.append(
+            f"Locked course {course.code} ({course.locked_day} {course.locked_slots}) "
+            f"has shared faculty across sections while combined_sections is false: {detail}. "
+            "Mark it combined or assign different faculty per section."
+        )
 
     # Capacity per section
     section_capacity = _available_slots_per_section(req)

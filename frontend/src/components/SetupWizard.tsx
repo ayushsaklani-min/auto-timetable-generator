@@ -125,6 +125,18 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
     setPreflightErrors([])
   }
 
+  async function readErrorMessage(r: Response): Promise<string> {
+    const txt = (await r.text()).trim()
+    try {
+      const parsed = JSON.parse(txt)
+      if (typeof parsed?.detail === 'string' && parsed.detail.trim()) return parsed.detail
+      if (typeof parsed?.error === 'string' && parsed.error.trim()) return parsed.error
+    } catch {
+      // fall back to raw text below
+    }
+    return `${r.status} ${txt.slice(0, 300)}`
+  }
+
   function buildPayload() {
     const elective_blocks = electives.map((b) => ({
       id: b.id,
@@ -189,6 +201,11 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(buildPayload()),
       })
+      if (!r.ok) {
+        setError(await readErrorMessage(r))
+        setPreview(null)
+        return
+      }
       const j = await r.json()
       if (!j.ok) {
         setError(j.error || 'Parse failed')
@@ -215,8 +232,7 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
         body: JSON.stringify(buildPayload()),
       })
       if (!r.ok) {
-        const txt = await r.text()
-        throw new Error(`${r.status} ${txt.slice(0, 200)}`)
+        throw new Error(await readErrorMessage(r))
       }
       const resp: GenerateResponse = await r.json()
       // fetch the parsed request too so the app has the canonical TimetableRequest

@@ -89,9 +89,25 @@ export interface GenerateResponse {
 
 const API = '/api'
 
+async function readErrorMessage(r: Response): Promise<string> {
+  const txt = (await r.text()).trim()
+  try {
+    const parsed = JSON.parse(txt)
+    if (typeof parsed?.detail === 'string' && parsed.detail.trim()) return parsed.detail
+    if (typeof parsed?.error === 'string' && parsed.error.trim()) return parsed.error
+    if (Array.isArray(parsed?.detail)) {
+      const first = parsed.detail.find((x: any) => typeof x?.msg === 'string')
+      if (first?.msg) return first.msg
+    }
+  } catch {
+    // fall back to raw text below
+  }
+  return `${r.status} ${txt.slice(0, 300)}`
+}
+
 async function jget<T>(path: string): Promise<T> {
   const r = await fetch(API + path)
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`)
+  if (!r.ok) throw new Error(await readErrorMessage(r))
   return r.json()
 }
 async function jpost<T>(path: string, body: unknown): Promise<T> {
@@ -100,7 +116,7 @@ async function jpost<T>(path: string, body: unknown): Promise<T> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`)
+  if (!r.ok) throw new Error(await readErrorMessage(r))
   return r.json()
 }
 

@@ -5,6 +5,17 @@ import ChatPanel from './components/ChatPanel'
 import SetupWizard from './components/SetupWizard'
 import LandingPage from './components/LandingPage'
 
+function buildStatusMessage(resp: GenerateResponse) {
+  if (!resp.timetable) return `Preflight failed: ${resp.preflight.errors.length} errors`
+  const tt = resp.timetable
+  const base = `${tt.status} · ${tt.classes.length} placements · ${tt.solve_time_sec.toFixed(2)}s · soft ${
+    resp.verification?.soft_score ?? 0
+  }/100`
+  const note = tt.notes?.[0]?.trim()
+  if (!note) return base
+  return `${base} · ${note}`
+}
+
 function baseFacultyName(name: string) {
   return name.replace(/\s*\([^)]*\)\s*$/, '').trim() || name
 }
@@ -107,15 +118,7 @@ export default function App() {
     try {
       const out = await api.generate(r)
       setResp(out)
-      if (out.timetable) {
-        setStatusMsg(
-          `${out.timetable.status} · ${out.timetable.classes.length} placements · ${out.timetable.solve_time_sec.toFixed(2)}s · soft ${
-            out.verification?.soft_score ?? 0
-          }/100`,
-        )
-      } else {
-        setStatusMsg(`Preflight failed: ${out.preflight.errors.length} errors`)
-      }
+      setStatusMsg(buildStatusMessage(out))
     } catch (e: any) {
       setStatusMsg(`Error: ${e.message}`)
     } finally {
@@ -291,16 +294,7 @@ export default function App() {
             setReq(newReq)
             setResp(newResp)
             setSectionId(newReq.sections[0]?.id ?? 'A')
-            const tt = newResp.timetable
-            if (tt) {
-              setStatusMsg(
-                `${tt.status} · ${tt.classes.length} placements · ${tt.solve_time_sec.toFixed(2)}s · soft ${
-                  newResp.verification?.soft_score ?? 0
-                }/100`,
-              )
-            } else {
-              setStatusMsg(`Preflight failed: ${newResp.preflight.errors.length} errors`)
-            }
+            setStatusMsg(buildStatusMessage(newResp))
             setWizardOpen(false)
           }}
         />
@@ -314,14 +308,7 @@ export default function App() {
             onApplied={(newResp, newReq) => {
               setReq(newReq)
               setResp(newResp)
-              const tt = newResp.timetable
-              if (tt) {
-                setStatusMsg(
-                  `${tt.status} · ${tt.classes.length} placements · ${tt.solve_time_sec.toFixed(2)}s · soft ${
-                    newResp.verification?.soft_score ?? 0
-                  }/100`,
-                )
-              }
+              setStatusMsg(buildStatusMessage(newResp))
             }}
             onExplain={async () => {
               if (!resp?.job_id) return 'No timetable yet — click Generate first.'
@@ -497,6 +484,9 @@ export default function App() {
             {resp?.preflight && !resp.preflight.ok && (
               <PreflightPanel errors={resp.preflight.errors} warnings={resp.preflight.warnings} />
             )}
+            {resp?.timetable?.notes && resp.timetable.notes.length > 0 && (
+              <SolverNotesPanel notes={resp.timetable.notes} />
+            )}
           </div>
         </section>
       </main>
@@ -568,6 +558,19 @@ function PreflightPanel({ errors, warnings }: { errors: string[]; warnings: stri
           </ul>
         </>
       )}
+    </div>
+  )
+}
+
+function SolverNotesPanel({ notes }: { notes: string[] }) {
+  return (
+    <div className="mt-4 border border-indigo-200 bg-indigo-50 rounded-lg p-3 text-xs">
+      <div className="font-semibold text-indigo-800 mb-1">Solver notes</div>
+      <ul className="list-disc pl-4 space-y-0.5">
+        {notes.map((n, i) => (
+          <li key={i}>{n}</li>
+        ))}
+      </ul>
     </div>
   )
 }

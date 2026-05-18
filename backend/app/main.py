@@ -172,6 +172,16 @@ def _normalise_draft_time_limit(limit: int) -> int:
     return max(5, min(int(limit or 20), 20))
 
 
+def _solve_or_422(req: TimetableRequest) -> Timetable:
+    """Run CP-SAT and surface modeling errors as actionable 422 responses."""
+    try:
+        return solve(req)
+    except RuntimeError as e:
+        raise HTTPException(422, f"Solver setup failed: {str(e)[:400]}")
+    except ValueError as e:
+        raise HTTPException(422, f"Solver input invalid: {str(e)[:400]}")
+
+
 @app.post("/draft/import-documents")
 async def draft_import_documents(
     files: list[UploadFile] = File(...),
@@ -308,7 +318,7 @@ def draft_build(body: DraftBuildRequest) -> GenerateResponse:
         return GenerateResponse(
             job_id=job_id, preflight=pf, timetable=None, verification=None
         )
-    tt = solve(req)
+    tt = _solve_or_422(req)
     vr = (
         verify(req, tt)
         if tt.status in ("OPTIMAL", "FEASIBLE")
@@ -338,7 +348,7 @@ def generate_endpoint(req: TimetableRequest) -> GenerateResponse:
         _save_job(job_id, payload)
         return GenerateResponse(job_id=job_id, preflight=pf, timetable=None, verification=None)
 
-    tt = solve(req)
+    tt = _solve_or_422(req)
     vr = verify(req, tt) if tt.status in ("OPTIMAL", "FEASIBLE") else VerificationReport(ok=False)
     job_id = uuid.uuid4().hex
     payload = {"req": req, "tt": tt, "verify": vr, "preflight": pf}
