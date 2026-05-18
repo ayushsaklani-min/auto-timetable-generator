@@ -78,7 +78,7 @@ function createStarterCourse(kind: CourseKind, index: number): CourseDraft {
       lockedSlotsText: '',
       combined: false,
       extraTypeText: '',
-      facultyMode: 'sections',
+      facultyMode: 'auto',
       facultyNames: [],
       facultyCount: 1,
       sameAsCode: '',
@@ -95,7 +95,7 @@ function createStarterCourse(kind: CourseKind, index: number): CourseDraft {
     lockedSlotsText: '',
     combined: false,
     extraTypeText: '',
-    facultyMode: 'sections',
+    facultyMode: 'auto',
     facultyNames: [],
     facultyCount: 1,
     sameAsCode: '',
@@ -208,7 +208,7 @@ export default function CoursesFacultyPanel({
       const result = payload as ImportResponse & { ok: true }
       onChange(result.raw_text)
       setImportResult(result)
-      setMode('guided')
+      setMode('raw')
     } catch (err) {
       setImportError(err instanceof Error ? err.message : 'Document import failed.')
     } finally {
@@ -462,7 +462,11 @@ function CourseRowCard({
   const facultySlots = Math.max(sectionIds.length, row.facultyNames.length, 1)
   const referenceCodes = courseCodes.filter((code) => code !== row.code)
   const courseCodeListId = `course-codes-${index}`
-  const facultyPreview = buildFacultySpec(row) || '(blank = backend auto placeholders)'
+  const facultyPreview =
+    buildFacultySpec(row) ||
+    (row.facultyMode === 'sections'
+      ? '(blank section names currently fall back to backend auto placeholders)'
+      : 'auto')
 
   function patch(next: Partial<CourseDraft>) {
     onChange({ ...row, ...next })
