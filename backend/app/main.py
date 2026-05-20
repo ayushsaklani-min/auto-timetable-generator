@@ -378,7 +378,8 @@ def job_export(job_id: str, fmt: str, faculty_id: Optional[str] = None) -> Respo
     tt: Timetable = job["tt"]
     fmt = fmt.lower()
     if fmt == "pdf":
-        return Response(render_pdf(req, tt), media_type="application/pdf")
+        faculty_ids = [part.strip() for part in (faculty_id or "").split(",") if part.strip()]
+        return Response(render_pdf(req, tt, faculty_ids=faculty_ids or None), media_type="application/pdf")
     if fmt in ("xlsx", "excel"):
         return Response(
             render_xlsx(req, tt),

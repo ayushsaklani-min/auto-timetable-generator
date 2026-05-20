@@ -192,6 +192,13 @@ export default function App() {
     }))
   }, [facultyRawClasses, facultyCourse, courseNameByCode])
 
+  const pdfExportHref =
+    resp?.job_id && view === 'faculty' && selectedFaculty
+      ? api.exportUrl(resp.job_id, 'pdf', selectedFaculty.ids.join(','))
+      : resp?.job_id
+        ? api.exportUrl(resp.job_id, 'pdf')
+        : '#'
+
   const status = resp?.timetable?.status
   const statusColor =
     status === 'OPTIMAL'
@@ -401,7 +408,7 @@ export default function App() {
               <div className="flex gap-1">
                 <a
                   className="px-2.5 py-1 text-xs rounded-md border border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:border-slate-300"
-                  href={api.exportUrl(resp.job_id, 'pdf')}
+                  href={pdfExportHref}
                   target="_blank"
                   rel="noreferrer"
                 >
