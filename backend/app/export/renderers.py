@@ -5,6 +5,7 @@ import io
 import json
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 from xml.sax.saxutils import escape
 
 from openpyxl import Workbook
@@ -1117,6 +1118,79 @@ def render_pdf(req: TimetableRequest, tt: Timetable, faculty_ids: list[str] | No
 # ---------------------------------------------------------------------------
 # Excel
 # ---------------------------------------------------------------------------
+def _excel_logo_path() -> Path | None:
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates = [
+        repo_root / "frontend" / "public" / "bmsitm-logo.png",
+        repo_root / "frontend" / "dist" / "bmsitm-logo.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _attach_excel_logo(ws, anchor: str = "A1") -> None:
+    logo_path = _excel_logo_path()
+    if not logo_path:
+        return
+    try:
+        from openpyxl.drawing.image import Image as XLImage
+    except Exception:
+        return
+    try:
+        image = XLImage(str(logo_path))
+        image.width = 64
+        image.height = 64
+        ws.add_image(image, anchor)
+    except Exception:
+        return
+
+
+def _apply_excel_heading(
+    ws,
+    *,
+    last_column: int,
+    title: str,
+    subtitle: str,
+    meta: str,
+) -> int:
+    title_fill = PatternFill("solid", fgColor="0E2447")
+    subtitle_fill = PatternFill("solid", fgColor="173561")
+    meta_fill = PatternFill("solid", fgColor="F7E8BF")
+    title_font = Font(bold=True, color="FFFFFF", size=15)
+    subtitle_font = Font(bold=True, color="FFFFFF", size=10)
+    meta_font = Font(bold=True, color="0E2447", size=9)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws.row_dimensions[1].height = 26
+    ws.row_dimensions[2].height = 20
+    ws.row_dimensions[3].height = 18
+    ws.row_dimensions[4].height = 22
+    ws.row_dimensions[5].height = 20
+    ws.row_dimensions[6].height = 8
+
+    ws.column_dimensions["A"].width = 11
+    _attach_excel_logo(ws, "A1")
+
+    heading_rows = [
+        ("BMS INSTITUTE OF TECHNOLOGY AND MANAGEMENT", title_fill, title_font),
+        ("DEPARTMENT OF ARTIFICIAL INTELLIGENCE AND MACHINE LEARNING", subtitle_fill, subtitle_font),
+        ("Academic Year: 2025-26 (EVEN Sem)", subtitle_fill, subtitle_font),
+        (title, meta_fill, meta_font),
+        (f"{subtitle} | {meta}", meta_fill, meta_font),
+    ]
+
+    for row_index, (text, fill, font) in enumerate(heading_rows, start=1):
+        ws.merge_cells(start_row=row_index, start_column=2, end_row=row_index, end_column=last_column)
+        cell = ws.cell(row=row_index, column=2, value=text)
+        cell.fill = fill
+        cell.font = font
+        cell.alignment = header_align
+
+    return 7
+
+
 def render_xlsx(req: TimetableRequest, tt: Timetable) -> bytes:
     wb = Workbook()
     wb.remove(wb.active)
@@ -1132,25 +1206,35 @@ def render_xlsx(req: TimetableRequest, tt: Timetable) -> bytes:
     break_font = Font(bold=True, color="161412", size=11)
     body_font = Font(size=9)
     body_alt = PatternFill("solid", fgColor="FFFBED")
+    today_label = datetime.now().strftime("%d/%m/%Y")
 
     for sec in req.sections:
         ws = wb.create_sheet(title=f"Sec {sec.id}")
+        last_column = len(cols) + 1
+        table_header_row = _apply_excel_heading(
+            ws,
+            last_column=last_column,
+            title=f"{sec.name} | Class Time Table",
+            subtitle=f"Class Room: {sec.classroom or '-'}",
+            meta=f"With Effect From: {today_label} | Version: 01",
+        )
+        first_data_row = table_header_row + 1
         # Column 1 = Day, columns 2.. = slots interleaved with breaks
-        ws.cell(row=1, column=1, value="Day")
+        ws.cell(row=table_header_row, column=1, value="Day")
         for j, c in enumerate(cols, start=2):
             if c["kind"] == "slot":
                 t = c["slot"]
-                ws.cell(row=1, column=j, value=f"Slot {t}\n{_slot_timing(req, t)}")
+                ws.cell(row=table_header_row, column=j, value=f"Slot {t}\n{_slot_timing(req, t)}")
             else:
-                ws.cell(row=1, column=j, value=c["label"])
-        for cell in ws[1]:
+                ws.cell(row=table_header_row, column=j, value=c["label"])
+        for cell in ws[table_header_row]:
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        ws.row_dimensions[1].height = 32
+        ws.row_dimensions[table_header_row].height = 32
 
         grid = _section_grid(tt, sec.id, days, slots)
-        for i, d in enumerate(days, start=2):
+        for i, d in enumerate(days, start=first_data_row):
             day_cell = ws.cell(row=i, column=1, value=d)
             day_cell.fill = day_fill
             day_cell.font = day_font
@@ -1171,13 +1255,13 @@ def render_xlsx(req: TimetableRequest, tt: Timetable) -> bytes:
 
         # Merge break columns vertically (header row through last data row) so
         # the label sits centred over its column, mirroring the UI grid.
-        last_row = 1 + len(days)
+        last_row = table_header_row + len(days)
         for j, c in enumerate(cols, start=2):
             if c["kind"] != "break":
                 continue
-            col_letter = ws.cell(row=1, column=j).column_letter
-            ws.merge_cells(start_row=1, start_column=j, end_row=last_row, end_column=j)
-            merged = ws.cell(row=1, column=j)
+            col_letter = ws.cell(row=table_header_row, column=j).column_letter
+            ws.merge_cells(start_row=table_header_row, start_column=j, end_row=last_row, end_column=j)
+            merged = ws.cell(row=table_header_row, column=j)
             merged.value = c["label"].replace(" ", "\n")
             merged.fill = break_fill
             merged.font = break_font
@@ -1189,19 +1273,43 @@ def render_xlsx(req: TimetableRequest, tt: Timetable) -> bytes:
         # Column widths
         for col in range(1, len(cols) + 2):
             if col == 1:
-                ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 8
+                ws.column_dimensions[ws.cell(row=table_header_row, column=col).column_letter].width = 11
             else:
                 desc = cols[col - 2]
                 if desc["kind"] == "slot":
-                    ws.column_dimensions[ws.cell(row=1, column=col).column_letter].width = 20
-        ws.freeze_panes = "B2"
+                    ws.column_dimensions[ws.cell(row=table_header_row, column=col).column_letter].width = 20
+        ws.freeze_panes = f"B{first_data_row}"
 
     # Faculty sheet
     fws = wb.create_sheet(title="Faculty view")
-    fws.append(["Faculty", "Day", "Slot", "Section", "Course"])
+    faculty_header_row = _apply_excel_heading(
+        fws,
+        last_column=5,
+        title="Faculty Time Table",
+        subtitle="Section-wise faculty schedule",
+        meta=f"With Effect From: {today_label}",
+    )
+    faculty_columns = ["Faculty", "Day", "Slot", "Section", "Course"]
+    for column_index, value in enumerate(faculty_columns, start=1):
+        fws.cell(row=faculty_header_row, column=column_index, value=value)
+    for cell in fws[faculty_header_row]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    fws.row_dimensions[faculty_header_row].height = 26
+    faculty_data_row = faculty_header_row + 1
     for c in tt.classes:
         if c.faculty_id:
-            fws.append([c.faculty_id, c.day, c.slot, c.section_id, c.label or c.course_code])
+            fws.cell(row=faculty_data_row, column=1, value=c.faculty_id)
+            fws.cell(row=faculty_data_row, column=2, value=c.day)
+            fws.cell(row=faculty_data_row, column=3, value=c.slot)
+            fws.cell(row=faculty_data_row, column=4, value=c.section_id)
+            fws.cell(row=faculty_data_row, column=5, value=c.label or c.course_code)
+            faculty_data_row += 1
+    for column in range(1, 6):
+        width = 18 if column in (1, 5) else 12
+        fws.column_dimensions[fws.cell(row=faculty_header_row, column=column).column_letter].width = width
+    fws.freeze_panes = f"A{faculty_header_row + 1}"
 
     buf = io.BytesIO()
     wb.save(buf)
