@@ -283,6 +283,28 @@ export default function CoursesFacultyPanel({
             and CSV directly, and uses Optiic OCR for scanned PDFs or image files when
             `OPTIIC_API_KEY` is configured.
           </div>
+          {(importResult || importError) && (
+            <div className="mt-3 space-y-2">
+              {importResult && (
+                <ImportSummary result={importResult} />
+              )}
+              {importError && (
+                <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900">
+                  {importError}
+                </div>
+              )}
+              {importResult?.warnings?.length ? (
+                <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
+                  <div className="font-semibold">Import warnings</div>
+                  <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                    {importResult.warnings.slice(0, 6).map((warning, index) => (
+                      <li key={index}>{warning}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </div>
+          )}
         </div>
 
         <div className="px-4 py-4">
@@ -374,43 +396,6 @@ export default function CoursesFacultyPanel({
         </div>
       </div>
 
-      {(importResult || importError) && (
-        <div className="space-y-3">
-          {importResult && (
-            <div className="rounded-md border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
-              Imported <b>{importResult.summary.documents}</b> file(s) into <b>{importResult.summary.courses}</b>{' '}
-              course row(s). New rows: <b>{importResult.summary.imported_courses}</b>. Faculty mappings:{' '}
-              <b>{importResult.summary.faculty_mappings}</b>.
-              {importResult.documents_info.length > 0 && (
-                <div className="mt-2 space-y-1">
-                  {importResult.documents_info.map((doc) => (
-                    <div key={`${doc.filename}-${doc.format}`}>
-                      <span className="font-medium">{doc.filename}</span>: {doc.course_rows} recognised row(s),{' '}
-                      {doc.faculty_rows} faculty mapping row(s)
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
-          {importError && (
-            <div className="rounded-md border border-rose-200 bg-rose-50 p-3 text-xs text-rose-900">
-              {importError}
-            </div>
-          )}
-          {importResult?.warnings?.length ? (
-            <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900">
-              <div className="font-semibold">Import warnings</div>
-              <ul className="mt-1 list-disc space-y-0.5 pl-4">
-                {importResult.warnings.slice(0, 6).map((warning, index) => (
-                  <li key={index}>{warning}</li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-        </div>
-      )}
-
       {preview && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-900">
           Parsed: <b>{preview.courses}</b> courses, <b>{preview.faculty}</b> faculty,{' '}
@@ -435,6 +420,26 @@ export default function CoursesFacultyPanel({
               </ul>
             </div>
           )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ImportSummary({ result }: { result: ImportResponse }) {
+  return (
+    <div className="rounded-md border border-sky-200 bg-sky-50 p-3 text-xs text-sky-900">
+      Imported <b>{result.summary.documents}</b> file(s) into <b>{result.summary.courses}</b>{' '}
+      course row(s). New rows: <b>{result.summary.imported_courses}</b>. Faculty mappings:{' '}
+      <b>{result.summary.faculty_mappings}</b>.
+      {result.documents_info.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {result.documents_info.map((doc) => (
+            <div key={`${doc.filename}-${doc.format}`}>
+              <span className="font-medium">{doc.filename}</span>: {doc.course_rows} recognised row(s),{' '}
+              {doc.faculty_rows} faculty mapping row(s)
+            </div>
+          ))}
         </div>
       )}
     </div>

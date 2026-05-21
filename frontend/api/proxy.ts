@@ -8,7 +8,10 @@ export default async function handler(req: Request): Promise<Response> {
   const backend = process.env.BACKEND_URL
   const token = process.env.BACKEND_API_TOKEN
   if (!backend) {
-    return new Response('BACKEND_URL not configured', { status: 500 })
+    return new Response(
+      'BACKEND_URL is not configured on Vercel. Set it to the deployed FastAPI backend base URL.',
+      { status: 500 },
+    )
   }
   // Vercel rewrite sends "/api/<anything>" here with the original path tail
   // in ?p=<path>. Fall back to stripping /api from pathname for direct calls.
