@@ -14,7 +14,7 @@ try:
 except ImportError:
     pass
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -84,6 +84,8 @@ def _save_job(job_id: str, payload: dict) -> None:
             "tt": payload["tt"].model_dump(mode="json") if payload.get("tt") else None,
             "verify": payload["verify"].model_dump(mode="json") if payload.get("verify") else None,
             "preflight": payload["preflight"].model_dump(mode="json") if payload.get("preflight") else None,
+            "state": payload.get("state") or "done",
+            "error": payload.get("error"),
         }
         (_JOBS_DIR / f"{job_id}.json").write_text(
             __import__("json").dumps(out), encoding="utf-8"
@@ -112,6 +114,8 @@ def _load_job(job_id: str) -> Optional[dict]:
             "tt": _TT.model_validate(raw["tt"]) if raw.get("tt") else None,
             "verify": _VR.model_validate(raw["verify"]) if raw.get("verify") else None,
             "preflight": _PR.model_validate(raw["preflight"]) if raw.get("preflight") else None,
+            "state": raw.get("state") or "done",
+            "error": raw.get("error"),
         }
         _jobs[job_id] = payload
         return payload
@@ -124,6 +128,8 @@ class GenerateResponse(BaseModel):
     preflight: PreflightReport
     timetable: Optional[Timetable] = None
     verification: Optional[VerificationReport] = None
+    state: str = "done"
+    error: Optional[str] = None
 
 
 @app.get("/health")
@@ -180,6 +186,81 @@ def _solve_or_422(req: TimetableRequest) -> Timetable:
         raise HTTPException(422, f"Solver setup failed: {str(e)[:400]}")
     except ValueError as e:
         raise HTTPException(422, f"Solver input invalid: {str(e)[:400]}")
+
+
+def _run_generate_job(job_id: str, req: TimetableRequest, pf: PreflightReport) -> None:
+    """Complete a solve job after the API response has returned."""
+    try:
+        tt = solve(req)
+        vr = (
+            verify(req, tt)
+            if tt.status in ("OPTIMAL", "FEASIBLE")
+            else VerificationReport(ok=False)
+        )
+        payload = {
+            "req": req,
+            "tt": tt,
+            "verify": vr,
+            "preflight": pf,
+            "state": "done",
+            "error": None,
+        }
+    except Exception as e:
+        payload = {
+            "req": req,
+            "tt": None,
+            "verify": None,
+            "preflight": pf,
+            "state": "error",
+            "error": str(e)[:400],
+        }
+    _jobs[job_id] = payload
+    _save_job(job_id, payload)
+
+
+def _queue_generate_job(
+    req: TimetableRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateResponse:
+    pf = validate(req)
+    job_id = uuid.uuid4().hex
+    if not pf.ok:
+        payload = {
+            "req": req,
+            "tt": None,
+            "verify": None,
+            "preflight": pf,
+            "state": "done",
+            "error": None,
+        }
+        _jobs[job_id] = payload
+        _save_job(job_id, payload)
+        return GenerateResponse(
+            job_id=job_id,
+            preflight=pf,
+            timetable=None,
+            verification=None,
+            state="done",
+        )
+
+    payload = {
+        "req": req,
+        "tt": None,
+        "verify": None,
+        "preflight": pf,
+        "state": "running",
+        "error": None,
+    }
+    _jobs[job_id] = payload
+    _save_job(job_id, payload)
+    background_tasks.add_task(_run_generate_job, job_id, req, pf)
+    return GenerateResponse(
+        job_id=job_id,
+        preflight=pf,
+        timetable=None,
+        verification=None,
+        state="running",
+    )
 
 
 @app.post("/draft/import-documents")
@@ -333,6 +414,51 @@ def draft_build(body: DraftBuildRequest) -> GenerateResponse:
     )
 
 
+@app.post("/draft/build_async", response_model=GenerateResponse)
+def draft_build_async(
+    body: DraftBuildRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateResponse:
+    """Build a draft request and queue the solve for proxy-safe polling."""
+    from .draft.from_paste import Skeleton, build_request as build_from_paste
+
+    sk_in = body.skeleton
+    sk = Skeleton(
+        days=sk_in.days,
+        slots_per_day=sk_in.slots_per_day,
+        slot_timings=[(a, b) for a, b in sk_in.slot_timings],
+        tea_after_slot=sk_in.tea_after_slot,
+        tea_minutes=sk_in.tea_minutes,
+        lunch_after_slot=sk_in.lunch_after_slot,
+        lunch_minutes=sk_in.lunch_minutes,
+        section_ids=sk_in.section_ids,
+        batches_per_section=sk_in.batches_per_section,
+        classroom_by_section=sk_in.classroom_by_section
+        or {s: "" for s in sk_in.section_ids},
+        inactive_sat_weeks=sk_in.inactive_sat_weeks,
+        sat_locks=[
+            (
+                lk.get("label", ""),
+                [int(s) for s in lk.get("slots", [])],
+                lk.get("sections") or None,
+            )
+            for lk in sk_in.sat_locks
+        ],
+        semester=sk_in.semester,
+    )
+    try:
+        req = build_from_paste(
+            sk,
+            body.courses_text,
+            elective_blocks_raw=body.elective_blocks,
+            time_limit_sec=_normalise_draft_time_limit(body.time_limit_sec),
+        )
+    except Exception as e:
+        raise HTTPException(400, f"Parse failed: {str(e)[:300]}")
+
+    return _queue_generate_job(req, background_tasks)
+
+
 @app.post("/preflight")
 def preflight_endpoint(req: TimetableRequest) -> PreflightReport:
     return validate(req)
@@ -357,15 +483,26 @@ def generate_endpoint(req: TimetableRequest) -> GenerateResponse:
     return GenerateResponse(job_id=job_id, preflight=pf, timetable=tt, verification=vr)
 
 
+@app.post("/generate/async", response_model=GenerateResponse)
+def generate_async_endpoint(
+    req: TimetableRequest,
+    background_tasks: BackgroundTasks,
+) -> GenerateResponse:
+    return _queue_generate_job(req, background_tasks)
+
+
 @app.get("/job/{job_id}")
 def job_get(job_id: str) -> dict:
     job = _load_job(job_id)
     if not job:
         raise HTTPException(404, "job not found")
     return {
+        "job_id": job_id,
         "preflight": job["preflight"],
         "timetable": job["tt"],
         "verification": job["verify"],
+        "state": job.get("state") or "done",
+        "error": job.get("error"),
     }
 
 
@@ -450,7 +587,10 @@ def llm_info() -> dict:
 
 
 @app.post("/llm/parse")
-def llm_parse(body: LLMParseRequest = Body(...)) -> JSONResponse:
+def llm_parse(
+    background_tasks: BackgroundTasks,
+    body: LLMParseRequest = Body(...),
+) -> JSONResponse:
     """Translate a natural-language edit into a patched TimetableRequest.
 
     Workflow:
@@ -483,26 +623,29 @@ def llm_parse(body: LLMParseRequest = Body(...)) -> JSONResponse:
         response["applied"] = applied
         response["errors"] = errors
         response["request"] = new_req.model_dump(mode="json")
-        # Re-solve immediately so the UI can pick up the new schedule.
+        # Queue the re-solve so Vercel's proxy does not have to hold a
+        # 20+ second function invocation open while CP-SAT finishes.
         try:
             pf = validate(new_req)
             if pf.ok:
-                tt = solve(new_req)
-                vr = (
-                    verify(new_req, tt)
-                    if tt.status in ("OPTIMAL", "FEASIBLE")
-                    else VerificationReport(ok=False)
-                )
                 job_id = uuid.uuid4().hex
-                payload = {"req": new_req, "tt": tt, "verify": vr, "preflight": pf}
+                payload = {
+                    "req": new_req,
+                    "tt": None,
+                    "verify": None,
+                    "preflight": pf,
+                    "state": "running",
+                    "error": None,
+                }
                 _jobs[job_id] = payload
                 _save_job(job_id, payload)
+                background_tasks.add_task(_run_generate_job, job_id, new_req, pf)
                 response["job_id"] = job_id
-                response["timetable"] = tt.model_dump(mode="json")
-                response["verification"] = vr.model_dump(mode="json")
                 response["preflight"] = pf.model_dump(mode="json")
+                response["state"] = "running"
             else:
                 response["preflight"] = pf.model_dump(mode="json")
+                response["state"] = "done"
         except Exception as e:
             response["solver_error"] = str(e)[:200]
     return JSONResponse(response)

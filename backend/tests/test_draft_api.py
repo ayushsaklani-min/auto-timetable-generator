@@ -51,3 +51,18 @@ def test_draft_preview_preserves_shorter_solver_limit():
     body = resp.json()
     assert body["ok"] is True
     assert body["request"]["time_limit_sec"] == 10
+
+
+def test_draft_build_async_returns_pollable_job():
+    resp = client.post("/draft/build_async", json=_payload(5))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["job_id"]
+    assert body["preflight"]["ok"] is True
+    assert body["state"] in {"running", "done"}
+
+    job_resp = client.get(f"/job/{body['job_id']}")
+    assert job_resp.status_code == 200
+    job = job_resp.json()
+    assert job["job_id"] == body["job_id"]
+    assert job["state"] in {"running", "done"}

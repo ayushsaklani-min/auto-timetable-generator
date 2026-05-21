@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { GenerateResponse, TimetableRequest } from '../lib/api'
+import { api, GenerateResponse, TimetableRequest } from '../lib/api'
 import CoursesFacultyPanel from './CoursesFacultyPanel'
 
 const API = '/api'
@@ -226,15 +226,7 @@ export default function SetupWizard({ onCancel, onGenerated }: Props) {
     setBusy(true)
     setError(null)
     try {
-      const r = await fetch(API + '/draft/build', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(buildPayload()),
-      })
-      if (!r.ok) {
-        throw new Error(await readErrorMessage(r))
-      }
-      const resp: GenerateResponse = await r.json()
+      const resp: GenerateResponse = await api.draftBuild(buildPayload())
       // fetch the parsed request too so the app has the canonical TimetableRequest
       const previewResp = await fetch(API + '/draft/preview', {
         method: 'POST',

@@ -85,9 +85,13 @@ export interface GenerateResponse {
   preflight: PreflightReport
   timetable: Timetable | null
   verification: VerificationReport | null
+  state?: string
+  error?: string | null
 }
 
 const API = '/api'
+const POLL_INTERVAL_MS = 1500
+const POLL_TIMEOUT_MS = 120_000
 
 async function readErrorMessage(r: Response): Promise<string> {
   const txt = (await r.text()).trim()
@@ -120,13 +124,43 @@ async function jpost<T>(path: string, body: unknown): Promise<T> {
   return r.json()
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+async function waitForJob(job_id: string, base?: Partial<GenerateResponse>): Promise<GenerateResponse> {
+  const started = Date.now()
+  while (Date.now() - started < POLL_TIMEOUT_MS) {
+    const job = await jget<GenerateResponse>(`/job/${job_id}`)
+    if (job.error || job.state === 'error') {
+      throw new Error(job.error || 'Generation failed')
+    }
+    if (job.timetable || job.preflight?.ok === false || job.state === 'done') {
+      return { ...base, ...job, job_id }
+    }
+    await sleep(POLL_INTERVAL_MS)
+  }
+  throw new Error('Timed out waiting for generated timetable')
+}
+
 export const api = {
   health: () => jget<{ status: string }>('/health'),
   bmsitReference: () => jget<TimetableRequest>('/reference/bmsit_4th_sem'),
   preflight: (req: TimetableRequest) => jpost<PreflightReport>('/preflight', req),
-  generate: (req: TimetableRequest) => jpost<GenerateResponse>('/generate', req),
-  llmParse: (text: string, prior?: TimetableRequest) =>
-    jpost<{
+  job: (job_id: string) => jget<GenerateResponse>(`/job/${job_id}`),
+  waitForJob,
+  generate: async (req: TimetableRequest) => {
+    const out = await jpost<GenerateResponse>('/generate/async', req)
+    if (out.state === 'running' && out.job_id) return waitForJob(out.job_id, out)
+    return out
+  },
+  draftBuild: async (body: unknown) => {
+    const out = await jpost<GenerateResponse>('/draft/build_async', body)
+    if (out.state === 'running' && out.job_id) return waitForJob(out.job_id, out)
+    return out
+  },
+  llmParse: async (text: string, prior?: TimetableRequest) => {
+    const out = await jpost<{
       action: string
       message: string
       applied?: string[]
@@ -137,11 +171,30 @@ export const api = {
       preflight?: PreflightReport
       job_id?: string
       active_model?: string
+      state?: string
+      error?: string | null
     }>('/llm/parse', {
       text,
       prior_request: prior,
       start_from_bmsit: !prior,
-    }),
+    })
+    if (out.action === 'patch' && out.job_id && out.state === 'running') {
+      const job = await waitForJob(out.job_id, {
+        preflight: out.preflight!,
+        timetable: out.timetable ?? null,
+        verification: out.verification ?? null,
+      })
+      return {
+        ...out,
+        preflight: job.preflight,
+        timetable: job.timetable ?? undefined,
+        verification: job.verification ?? undefined,
+        state: job.state,
+        error: job.error,
+      }
+    }
+    return out
+  },
   llmExplain: (job_id: string) => jpost<{ explanation: string }>('/llm/explain', { job_id }),
   exportUrl: (job_id: string, fmt: 'pdf' | 'xlsx' | 'json', faculty_id?: string) => {
     const q = faculty_id ? `?faculty_id=${encodeURIComponent(faculty_id)}` : ''
