@@ -189,7 +189,7 @@ async def draft_import_documents(
     section_ids: str = Form(""),
     replace_existing: bool = Form(True),
 ) -> dict:
-    """Extract course/faculty data from uploaded PDF/DOCX files into Step 2 text."""
+    """Extract course/faculty data from uploaded documents into Step 2 text."""
     from .draft.import_docs import import_course_documents
 
     uploaded: list[tuple[str, bytes]] = []

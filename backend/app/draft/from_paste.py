@@ -13,7 +13,8 @@ The paste format is intentionally forgiving and spreadsheet-friendly:
     activity locked=FRI:5,6,7 (locked to a specific day + slot list)
 
   Faculty list (after the 4th comma):
-    Dr A; Dr B; Dr C            (teacher pool, auto-balanced across sections)
+    Dr A; Dr B; ...             (one per section when the count matches sections)
+    Dr A; Dr B; Dr C            (otherwise teacher pool, auto-balanced)
     same-as=BAI402              (re-use the faculty assigned to BAI402)
     auto                        (auto-generate "<Code> Faculty X" placeholders)
     x6                          (generate 6 placeholders)
@@ -398,6 +399,27 @@ def build_request(
                 )
                 global_teacher_loads[teacher_id] += 1
 
+    def assign_section_order(course: ParsedCourse, teacher_ids: list[str]) -> None:
+        for sec_id, teacher_id in zip(skeleton.section_ids, teacher_ids):
+            if course.type is CourseType.LAB:
+                for batch_id in section_batches[sec_id]:
+                    append_assignment(
+                        teacher_id,
+                        course_code=course.code,
+                        section_id=sec_id,
+                        is_lab=True,
+                        batch_id=batch_id,
+                    )
+                    global_teacher_loads[teacher_id] += 1
+            else:
+                append_assignment(
+                    teacher_id,
+                    course_code=course.code,
+                    section_id=sec_id,
+                    is_lab=False,
+                )
+                global_teacher_loads[teacher_id] += 1
+
     for p in parsed:
         if p.code in elective_course_codes:
             continue
@@ -435,6 +457,9 @@ def build_request(
             continue
 
         teacher_ids = [make_fac(name).id for name in names_or_directives]
+        if len(teacher_ids) == len(skeleton.section_ids):
+            assign_section_order(p, teacher_ids)
+            continue
         assign_pool(p, teacher_ids)
 
     # ---- Build elective blocks ----

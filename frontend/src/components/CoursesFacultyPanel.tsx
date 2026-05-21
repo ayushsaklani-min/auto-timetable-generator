@@ -247,7 +247,7 @@ export default function CoursesFacultyPanel({
                 ref={fileInputRef}
                 type="file"
                 multiple
-                accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                accept=".pdf,.docx,.xlsx,.xlsm,.csv,.png,.jpg,.jpeg,.tif,.tiff,.gif,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/csv,image/png,image/jpeg,image/tiff,image/gif"
                 onChange={handleFileSelection}
                 className="hidden"
               />
@@ -257,7 +257,7 @@ export default function CoursesFacultyPanel({
                 disabled={busy || importBusy}
                 className="rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
               >
-                {importBusy ? 'Importing...' : 'Import PDF/DOCX'}
+                {importBusy ? 'Importing...' : 'Import file'}
               </button>
               <button
                 type="button"
@@ -279,8 +279,9 @@ export default function CoursesFacultyPanel({
             <StatPill label={`${rawLineCount} non-empty lines`} tone="slate" />
           </div>
           <div className="mt-3 text-[11px] leading-5 text-slate-500">
-            Upload one or more subject/faculty documents. The importer reads `pdf` and `docx`,
-            merges the recognised course and faculty rows, and replaces the current Step 2 text.
+            Upload one or more subject/faculty documents. The importer reads PDF, DOCX, XLSX,
+            and CSV directly, and uses Optiic OCR for scanned PDFs or image files when
+            `OPTIIC_API_KEY` is configured.
           </div>
         </div>
 
