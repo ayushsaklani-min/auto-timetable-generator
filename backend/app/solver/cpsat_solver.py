@@ -196,6 +196,11 @@ class TimetableSolver:
         self._faculty_slot_occupancy_cache: dict[
             tuple[str, str, int], list[cp_model.IntVar]
         ] = {}
+        self._section_occupied_cache: dict[tuple[str, str, int], cp_model.IntVar] = {}
+        self._faculty_occupied_cache: dict[tuple[str, str, int], cp_model.IntVar] = {}
+        self._room_occupied_cache: dict[tuple[str, str, int], cp_model.IntVar] = {}
+        self._true_var = self.model.NewConstant(1)
+        self._false_var = self.model.NewConstant(0)
 
     # ------------------------------------------------------------------
     # Reservations
@@ -258,6 +263,89 @@ class TimetableSolver:
 
         self._faculty_slot_occupancy_cache[key] = occupancies
         return occupancies
+
+    def _bool_or(self, terms: list[cp_model.IntVar], name: str) -> cp_model.IntVar:
+        if not terms:
+            return self._false_var
+        if len(terms) == 1:
+            return terms[0]
+        out = self.model.NewBoolVar(name)
+        self.model.AddMaxEquality(out, terms)
+        return out
+
+    def _bool_not(self, term: cp_model.IntVar, name: str) -> cp_model.IntVar:
+        out = self.model.NewBoolVar(name)
+        self.model.Add(out + term == 1)
+        return out
+
+    def _bool_and(
+        self,
+        terms: list[cp_model.IntVar],
+        name: str,
+    ) -> cp_model.IntVar:
+        if not terms:
+            return self._false_var
+        if len(terms) == 1:
+            return terms[0]
+        out = self.model.NewBoolVar(name)
+        for term in terms:
+            self.model.Add(out <= term)
+        self.model.Add(out >= sum(terms) - (len(terms) - 1))
+        return out
+
+    def _section_slot_occupied(self, sec_id: str, day: str, slot: int) -> cp_model.IntVar:
+        key = (sec_id, day, slot)
+        cached = self._section_occupied_cache.get(key)
+        if cached is not None:
+            return cached
+        if key in self._reserved:
+            occupied = self._true_var
+        else:
+            occupied = self._bool_or(
+                self._section_slot_occupancies(sec_id, day, slot),
+                f"sec_used_{sec_id}_{day}_{slot}",
+            )
+        self._section_occupied_cache[key] = occupied
+        return occupied
+
+    def _faculty_slot_occupied(self, fac_id: str, day: str, slot: int) -> cp_model.IntVar:
+        key = (fac_id, day, slot)
+        cached = self._faculty_occupied_cache.get(key)
+        if cached is not None:
+            return cached
+        has_reserved = any(
+            sc.faculty_id == fac_id
+            for (sec_id, d, t), sc in self._reserved.items()
+            if d == day and t == slot
+        )
+        if has_reserved:
+            occupied = self._true_var
+        else:
+            occupied = self._bool_or(
+                self._faculty_slot_occupancies(fac_id, day, slot),
+                f"fac_used_{fac_id}_{day}_{slot}",
+            )
+        self._faculty_occupied_cache[key] = occupied
+        return occupied
+
+    def _room_slot_occupied(self, room: str, day: str, slot: int) -> cp_model.IntVar:
+        key = (room, day, slot)
+        cached = self._room_occupied_cache.get(key)
+        if cached is not None:
+            return cached
+        occupied = self._bool_or(
+            self._room_contrib.get(key, []),
+            f"room_used_{room}_{day}_{slot}",
+        )
+        self._room_occupied_cache[key] = occupied
+        return occupied
+
+    def _usable_slots(self) -> list[int]:
+        return [slot for slot in self.slots if slot not in self._blocked_slots]
+
+    def _weekday_days(self) -> list[str]:
+        days = [day for day in self.days if day != "SAT"]
+        return days or list(self.days)
 
     def _apply_elective_blocks(self) -> None:
         """Reserve global elective slots in every applying section.
@@ -774,6 +862,133 @@ class TimetableSolver:
     # ------------------------------------------------------------------
     # Soft constraints
     # ------------------------------------------------------------------
+    def _add_idle_gap_penalties(
+        self,
+        penalties: list[cp_model.IntVar],
+        owner_ids: list[str],
+        occupied_fn,
+        label: str,
+        weight: int,
+        days: Optional[list[str]] = None,
+    ) -> None:
+        """Penalize empty cells trapped between earlier and later work."""
+        usable_slots = self._usable_slots()
+        if len(usable_slots) < 3:
+            return
+        for owner_id in owner_ids:
+            for day in days or self.days:
+                occ_by_slot = [
+                    (slot, occupied_fn(owner_id, day, slot))
+                    for slot in usable_slots
+                ]
+                for idx in range(1, len(occ_by_slot) - 1):
+                    slot, occupied = occ_by_slot[idx]
+                    before = self._bool_or(
+                        [occ for _slot, occ in occ_by_slot[:idx]],
+                        f"{label}_before_{owner_id}_{day}_{slot}",
+                    )
+                    after = self._bool_or(
+                        [occ for _slot, occ in occ_by_slot[idx + 1:]],
+                        f"{label}_after_{owner_id}_{day}_{slot}",
+                    )
+                    empty = self._bool_not(
+                        occupied,
+                        f"{label}_empty_{owner_id}_{day}_{slot}",
+                    )
+                    idle = self._bool_and(
+                        [before, empty, after],
+                        f"{label}_idle_{owner_id}_{day}_{slot}",
+                    )
+                    penalties.append(self._scale(idle, weight))
+
+    def _add_common_blank_penalties(self, penalties: list[cp_model.IntVar]) -> None:
+        """Discourage columns where every section is free inside the day."""
+        usable_slots = self._usable_slots()
+        if len(usable_slots) < 3 or not self.section_ids:
+            return
+        post_lunch = self.tc.lunch_break.after_slot + 1
+        for day in self._weekday_days():
+            section_any_by_slot: list[tuple[int, cp_model.IntVar]] = []
+            for slot in usable_slots:
+                any_section = self._bool_or(
+                    [
+                        self._section_slot_occupied(sec_id, day, slot)
+                        for sec_id in self.section_ids
+                    ],
+                    f"any_section_{day}_{slot}",
+                )
+                section_any_by_slot.append((slot, any_section))
+
+            for idx in range(1, len(section_any_by_slot) - 1):
+                slot, any_section = section_any_by_slot[idx]
+                before = self._bool_or(
+                    [occ for _slot, occ in section_any_by_slot[:idx]],
+                    f"common_before_{day}_{slot}",
+                )
+                after = self._bool_or(
+                    [occ for _slot, occ in section_any_by_slot[idx + 1:]],
+                    f"common_after_{day}_{slot}",
+                )
+                empty_for_all = self._bool_not(any_section, f"common_empty_{day}_{slot}")
+                common_gap = self._bool_and(
+                    [before, empty_for_all, after],
+                    f"common_gap_{day}_{slot}",
+                )
+                weight = 55 if slot == post_lunch else 16
+                penalties.append(self._scale(common_gap, weight))
+
+    def _add_late_slot_penalties(self, penalties: list[cp_model.IntVar]) -> None:
+        """Prefer compact earlier days once breaks and locks are respected."""
+        post_lunch = self.tc.lunch_break.after_slot + 1
+        for sec_id in self.section_ids:
+            for day in self._weekday_days():
+                for slot in self._usable_slots():
+                    if slot <= post_lunch:
+                        continue
+                    weight = (slot - post_lunch) * 3
+                    penalties.append(
+                        self._scale(
+                            self._section_slot_occupied(sec_id, day, slot),
+                            weight,
+                        )
+                    )
+
+    def _add_daily_spread_penalties(
+        self,
+        penalties: list[cp_model.IntVar],
+        owner_ids: list[str],
+        occupied_fn,
+        label: str,
+        weight: int,
+    ) -> None:
+        """Balance workload by minimizing max-day minus min-day load."""
+        days = self._weekday_days()
+        if len(days) < 2:
+            return
+        usable_slots = self._usable_slots()
+        for owner_id in owner_ids:
+            day_loads: list[cp_model.IntVar] = []
+            for day in days:
+                terms = [occupied_fn(owner_id, day, slot) for slot in usable_slots]
+                load = self.model.NewIntVar(
+                    0,
+                    len(usable_slots),
+                    f"{label}_load_{owner_id}_{day}",
+                )
+                self.model.Add(load == sum(terms))
+                day_loads.append(load)
+            max_v = self.model.NewIntVar(0, len(usable_slots), f"{label}_max_{owner_id}")
+            min_v = self.model.NewIntVar(0, len(usable_slots), f"{label}_min_{owner_id}")
+            self.model.AddMaxEquality(max_v, day_loads)
+            self.model.AddMinEquality(min_v, day_loads)
+            spread = self.model.NewIntVar(
+                0,
+                len(usable_slots),
+                f"{label}_spread_{owner_id}",
+            )
+            self.model.Add(spread == max_v - min_v)
+            penalties.append(self._scale(spread, weight))
+
     def _add_soft_constraints(self) -> list[cp_model.IntVar]:
         penalties: list[cp_model.IntVar] = []
 
@@ -813,20 +1028,8 @@ class TimetableSolver:
                 self.model.Add(sum(day_vars) - 2 <= of)
                 penalties.append(self._scale(of, 8))
 
-        # S3: keep post-lunch slot light (slot = lunch_after + 1)
-        post_lunch = self.tc.lunch_break.after_slot + 1
-        if post_lunch in self.slots:
-            for sec_id in self.section_ids:
-                for d in self.days:
-                    occupancies = self._section_slot_occupancies(sec_id, d, post_lunch)
-                    if not occupancies:
-                        continue
-                    # penalty if any class lands there (small)
-                    pen = self.model.NewIntVar(0, 1, f"s3_{sec_id}_{d}")
-                    self.model.Add(sum(occupancies) <= pen)
-                    penalties.append(self._scale(pen, 5))
-
         # S6: activities prefer afternoon (slot >= post_lunch)
+        post_lunch = self.tc.lunch_break.after_slot + 1
         for task, vm in self._task_vars:
             if task.kind != "ACTIVITY":
                 continue
@@ -839,27 +1042,65 @@ class TimetableSolver:
                 self.model.Add(sum(morning_vars) <= pen)
                 penalties.append(self._scale(pen, 2))
 
-        # S4: faculty workload balance across days.
-        # Penalize per-faculty (max_load_day - min_load_day) approximation.
-        for fac in self.req.faculty:
-            day_loads = []
-            for d in self.days:
-                day_vars: list[cp_model.IntVar] = []
-                for t in self.slots:
-                    day_vars.extend(self._faculty_slot_occupancies(fac.id, d, t))
-                if not day_vars:
-                    continue
-                load = self.model.NewIntVar(0, len(day_vars), f"load_{fac.id}_{d}")
-                self.model.Add(load == sum(day_vars))
-                day_loads.append(load)
-            if len(day_loads) >= 2:
-                max_v = self.model.NewIntVar(0, 20, f"max_{fac.id}")
-                min_v = self.model.NewIntVar(0, 20, f"min_{fac.id}")
-                self.model.AddMaxEquality(max_v, day_loads)
-                self.model.AddMinEquality(min_v, day_loads)
-                spread = self.model.NewIntVar(0, 20, f"spread_{fac.id}")
-                self.model.Add(spread == max_v - min_v)
-                penalties.append(self._scale(spread, 4))
+        active_faculty_ids = sorted(
+            {fac_id for fac_id, _day, _slot in self._fac_contrib}
+            | {
+                sc.faculty_id
+                for sc in self._reserved.values()
+                if sc.faculty_id
+            }
+        )
+        active_rooms = sorted({room for room, _day, _slot in self._room_contrib})
+
+        # Lowest-waste objective: keep days compact for students first, then
+        # faculty and rooms, while preserving all hard conflict constraints.
+        self._add_idle_gap_penalties(
+            penalties,
+            self.section_ids,
+            self._section_slot_occupied,
+            "student",
+            45,
+            days=self._weekday_days(),
+        )
+        self._add_common_blank_penalties(penalties)
+        self._add_late_slot_penalties(penalties)
+        self._add_daily_spread_penalties(
+            penalties,
+            self.section_ids,
+            self._section_slot_occupied,
+            "section",
+            9,
+        )
+        self._add_idle_gap_penalties(
+            penalties,
+            active_faculty_ids,
+            self._faculty_slot_occupied,
+            "faculty",
+            14,
+            days=self._weekday_days(),
+        )
+        self._add_daily_spread_penalties(
+            penalties,
+            active_faculty_ids,
+            self._faculty_slot_occupied,
+            "faculty",
+            5,
+        )
+        self._add_idle_gap_penalties(
+            penalties,
+            active_rooms,
+            self._room_slot_occupied,
+            "room",
+            6,
+            days=self._weekday_days(),
+        )
+        self._add_daily_spread_penalties(
+            penalties,
+            active_rooms,
+            self._room_slot_occupied,
+            "room",
+            3,
+        )
 
         return penalties
 

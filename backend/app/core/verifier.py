@@ -303,26 +303,41 @@ def verify(req: TimetableRequest, tt: Timetable) -> VerificationReport:
 
 
 def _soft_score(req: TimetableRequest, tt: Timetable) -> int:
-    """Rough soft-constraint quality score, 0..100."""
+    """Rough lowest-waste quality score, 0..100."""
     if not tt.classes:
         return 0
     tc = req.time_config
+    blocked_slots = _blocked_slots(req)
+    usable_slots = [s for s in range(1, tc.slots_per_day + 1) if s not in blocked_slots]
+    weekday_days = [d for d in tc.days if d != "SAT"] or list(tc.days)
     post_lunch = tc.lunch_break.after_slot + 1
     cls_by_sec_day = defaultdict(list)
+    sec_slots: dict[tuple[str, str], set[int]] = defaultdict(set)
+    fac_slots: dict[tuple[str, str], set[int]] = defaultdict(set)
+    room_slots: dict[tuple[str, str], set[int]] = defaultdict(set)
     for c in tt.classes:
         cls_by_sec_day[(c.section_id, c.day)].append(c)
+        if c.slot in blocked_slots:
+            continue
+        sec_slots[(c.section_id, c.day)].add(c.slot)
+        if c.faculty_id:
+            fac_slots[(c.faculty_id, c.day)].add(c.slot)
+        if c.room:
+            room_slots[(c.room, c.day)].add(c.slot)
 
-    n_sections = max(len({c.section_id for c in tt.classes}), 1)
-    n_days = max(len(tc.days), 1)
+    section_ids = {s.id for s in req.sections} or {c.section_id for c in tt.classes}
+    n_sections = max(len(section_ids), 1)
+    n_days = max(len(weekday_days), 1)
     cells_max = n_sections * n_days
 
     dup_total = 0
     for (sec, d), items in cls_by_sec_day.items():
         seen: dict[str, int] = defaultdict(int)
         for c in items:
-            seen[c.course_code] += 1
+            if not c.is_lab:
+                seen[c.course_code] += 1
         for _code, n in seen.items():
-            if n > 1 and not items[0].is_lab:
+            if n > 1:
                 dup_total += n - 1
     dup_score = 100 * (1 - min(1.0, dup_total / max(cells_max * 0.3, 1)))
 
@@ -337,10 +352,81 @@ def _soft_score(req: TimetableRequest, tt: Timetable) -> int:
             hc_overflow += hc - 2
     hc_score = 100 * (1 - min(1.0, hc_overflow / max(cells_max * 0.4, 1)))
 
-    pl_classes = sum(
-        1 for c in tt.classes if c.slot == post_lunch and not c.is_lab
-    )
-    pl_score = 100 * (1 - min(1.0, pl_classes / max(n_sections * n_days * 0.6, 1)))
+    def idle_gaps(slots: set[int]) -> int:
+        if len(slots) < 2:
+            return 0
+        first = min(slots)
+        last = max(slots)
+        return sum(1 for slot in usable_slots if first < slot < last and slot not in slots)
 
-    final = round(0.45 * dup_score + 0.35 * hc_score + 0.20 * pl_score)
+    student_gaps = sum(
+        idle_gaps(sec_slots[(sec_id, day)])
+        for sec_id in section_ids
+        for day in weekday_days
+    )
+    gap_capacity = max(n_sections * n_days * max(len(usable_slots) - 2, 1), 1)
+    student_gap_score = 100 * (1 - min(1.0, student_gaps / gap_capacity))
+
+    common_gaps = 0
+    for day in weekday_days:
+        used = {
+            slot
+            for slot in usable_slots
+            if any(slot in sec_slots[(sec_id, day)] for sec_id in section_ids)
+        }
+        if len(used) < 2:
+            continue
+        first = min(used)
+        last = max(used)
+        common_gaps += sum(
+            2 if slot == post_lunch else 1
+            for slot in usable_slots
+            if first < slot < last and slot not in used
+        )
+    common_gap_score = 100 * (1 - min(1.0, common_gaps / max(n_days * 3, 1)))
+
+    active_faculty = {c.faculty_id for c in tt.classes if c.faculty_id}
+    faculty_waste = 0
+    for fac_id in active_faculty:
+        loads = []
+        for day in weekday_days:
+            slots = fac_slots[(fac_id, day)]
+            loads.append(len(slots))
+            faculty_waste += idle_gaps(slots)
+        if loads:
+            faculty_waste += max(loads) - min(loads)
+    faculty_score = 100 * (
+        1 - min(1.0, faculty_waste / max(len(active_faculty) * n_days * 2, 1))
+    )
+
+    active_rooms = {c.room for c in tt.classes if c.room}
+    room_waste = 0
+    for room in active_rooms:
+        loads = []
+        for day in weekday_days:
+            slots = room_slots[(room, day)]
+            loads.append(len(slots))
+            room_waste += idle_gaps(slots)
+        if loads:
+            room_waste += max(loads) - min(loads)
+    room_score = 100 * (
+        1 - min(1.0, room_waste / max(len(active_rooms) * n_days * 2, 1))
+    )
+
+    late_units = sum(
+        max(0, c.slot - post_lunch)
+        for c in tt.classes
+        if c.day in weekday_days and c.slot > post_lunch and not c.is_lab
+    )
+    late_score = 100 * (1 - min(1.0, late_units / max(cells_max * 1.5, 1)))
+
+    final = round(
+        0.15 * dup_score
+        + 0.15 * hc_score
+        + 0.30 * student_gap_score
+        + 0.15 * common_gap_score
+        + 0.15 * faculty_score
+        + 0.05 * room_score
+        + 0.05 * late_score
+    )
     return max(0, min(100, int(final)))
